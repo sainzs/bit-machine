@@ -9,14 +9,10 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import {
-	createBashToolDefinition,
-	defineTool,
-	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Budget } from "./budget.ts";
-import { recordObservation, type RunLedger } from "./ledger.ts";
+import { type RunLedger, recordObservation } from "./ledger.ts";
 
 const execFileAsync = promisify(execFile);
 

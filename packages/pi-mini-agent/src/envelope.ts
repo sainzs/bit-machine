@@ -88,9 +88,7 @@ export function formatEnvelope(result: RunResult): string {
 		const shown = result.filesChanged.slice(0, MAX_FILES_LISTED);
 		const extra = result.filesChanged.length - shown.length;
 		const label =
-			result.filesChangedSource === "observed"
-				? "files changed (observed)"
-				: "files touched (claimed, unverified)";
+			result.filesChangedSource === "observed" ? "files changed (observed)" : "files touched (claimed, unverified)";
 		lines.push(`${label}: ${shown.join(", ")}${extra > 0 ? ` (+${extra} more)` : ""}`);
 	}
 

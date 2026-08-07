@@ -1,0 +1,17 @@
+{
+	"name": "bit-machine-harness",
+	"version": "0.1.0",
+	"description": "bit-machine's continual layer: standing memory injected per-turn, persisted across sessions.",
+	"license": "MIT",
+	"type": "module",
+	"files": ["src", "README.md"],
+	"pi": { "extensions": ["./src/index.ts"] },
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "node --experimental-strip-types --test tests/*.test.ts"
+	}
+}

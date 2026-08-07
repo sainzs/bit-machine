@@ -94,11 +94,7 @@ export function buildSystemPrompt(input: PromptInput): string {
  * It is data about *this* task, and keeping the system prompt identical across
  * runs preserves the cacheable prefix.
  */
-export function buildTaskMessage(
-	task: string,
-	contextPack: string | undefined,
-	accept?: string,
-): string {
+export function buildTaskMessage(task: string, contextPack: string | undefined, accept?: string): string {
 	const parts = [task];
 	if (contextPack?.trim()) {
 		parts.push(

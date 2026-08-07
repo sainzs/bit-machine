@@ -23,19 +23,19 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Budget, type BudgetLimits, type ExitReason, type TreeBudget } from "./budget.ts";
 import type { RunResult } from "./envelope.ts";
-import { appendRecord, createLedger } from "./ledger.ts";
 import { captureLeaseBaseline, leaseViolations, observeChanges } from "./lease.ts";
+import { appendRecord, createLedger } from "./ledger.ts";
 import { MiniResourceLoader } from "./loader.ts";
 import { buildSystemPrompt, buildTaskMessage } from "./prompt.ts";
-import { runAcceptance } from "./verify.ts";
 import {
 	createLocateTool,
 	createShTool,
 	createSubmitTool,
-	scoutCanServe,
 	SH_COMMAND_PREFIX,
 	type SubmitDetails,
+	scoutCanServe,
 } from "./tools.ts";
+import { runAcceptance } from "./verify.ts";
 
 export interface RunOptions {
 	task: string;
@@ -177,9 +177,7 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 		}
 	}
 
-	let exitReason: ExitReason = submitted
-		? "submitted"
-		: (budget.tripped ?? stopReason ?? "error");
+	let exitReason: ExitReason = submitted ? "submitted" : (budget.tripped ?? stopReason ?? "error");
 
 	// A dead model binding fails on the FIRST provider call with an auth/config
 	// error. Without this classification it reads as a generic "error" — or
@@ -194,13 +192,10 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	const changes = await observeChanges(options.cwd, leaseBaseline);
 	const claimed = submitted?.filesChanged ?? [];
 	const observed = changes.observed;
-	const violations =
-		observed !== undefined ? leaseViolations(observed, options.lease ?? []) : [];
+	const violations = observed !== undefined ? leaseViolations(observed, options.lease ?? []) : [];
 
 	// The caller's definition of done, run by the harness, after the child is gone.
-	const verification = options.accept
-		? await runAcceptance(options.accept, options.cwd)
-		: undefined;
+	const verification = options.accept ? await runAcceptance(options.accept, options.cwd) : undefined;
 	if (verification) {
 		appendRecord(ledger.transcript, { type: "verification", ...verification });
 	}

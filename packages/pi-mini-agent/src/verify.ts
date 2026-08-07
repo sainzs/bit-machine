@@ -36,11 +36,7 @@ export interface Verification {
 	output: string;
 }
 
-export function runAcceptance(
-	command: string,
-	cwd: string,
-	timeoutMs = DEFAULT_TIMEOUT_MS,
-): Promise<Verification> {
+export function runAcceptance(command: string, cwd: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Verification> {
 	return new Promise((resolve) => {
 		execFile(
 			"bash",
@@ -56,9 +52,8 @@ export function runAcceptance(
 					resolve({ command, exitCode: 0, ok: true, output });
 					return;
 				}
-				const code = typeof (error as { code?: unknown }).code === "number"
-					? ((error as { code: number }).code)
-					: null;
+				const code =
+					typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : null;
 				const timedOut = (error as { killed?: boolean }).killed === true && code === null;
 				resolve({
 					command,
