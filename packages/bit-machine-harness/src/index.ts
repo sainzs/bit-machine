@@ -20,11 +20,19 @@ import { renderMemorySection } from "./prompt.ts";
 import { harnessPath, load, remove, type Scope, upsert } from "./store.ts";
 
 export default function (pi: ExtensionAPI) {
+	const liveMemory = process.env.BIT_MACHINE_LIVE_MEMORY === "1";
+	let cachedSection: string | undefined;
+	let sectionLoaded = false;
+
 	pi.on("before_agent_start", (event) => {
-		const cwd = process.cwd();
-		const globalMems = load(harnessPath("global", cwd)).memories;
-		const projectMems = load(harnessPath("project", cwd)).memories;
-		const section = renderMemorySection(globalMems, projectMems);
+		if (!sectionLoaded || liveMemory) {
+			const cwd = process.cwd();
+			const globalMems = load(harnessPath("global", cwd)).memories;
+			const projectMems = load(harnessPath("project", cwd)).memories;
+			cachedSection = renderMemorySection(globalMems, projectMems) || undefined;
+			sectionLoaded = true;
+		}
+		const section = cachedSection;
 		if (!section) return undefined;
 		return { systemPrompt: event.systemPrompt + section };
 	});

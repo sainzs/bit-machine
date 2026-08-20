@@ -14,12 +14,21 @@
  */
 
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { MiniResourceLoader } from "../src/loader.ts";
 
 const cwd = process.cwd();
-const agentDir = `${process.env.HOME}/.pi/agent`;
+const agentDir = mkdtempSync(join(tmpdir(), "pi-mini-agent-ambient-"));
+mkdirSync(join(agentDir, "skills", "ambient-test"), { recursive: true });
+writeFileSync(
+	join(agentDir, "skills", "ambient-test", "SKILL.md"),
+	"---\nname: ambient-test\ndescription: controlled ambient resource for discovery testing\n---\n",
+);
+after(() => rmSync(agentDir, { recursive: true, force: true }));
 
 test("pi's default discovery would load ambient extensions into a nested session", async () => {
 	const settingsManager = SettingsManager.create(cwd, agentDir);
