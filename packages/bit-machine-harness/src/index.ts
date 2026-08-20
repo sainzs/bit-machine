@@ -12,6 +12,16 @@
  * exposes the full prompt precisely so extensions can compose). One tool,
  * `remember`, mutates the store; the file on disk is the source of truth and
  * is human-editable by design.
+ *
+ * The section is SNAPSHOTTED on the first turn and reused for the process
+ * lifetime. Re-reading per turn looks fresher but proved actively harmful:
+ * any `remember` upsert from any concurrent session mutates the system prompt
+ * under every live session, invalidating every server-side prompt-prefix
+ * cache at the memory block and forcing a full re-prefill of the entire
+ * context (observed live 2026-08-17: ~21K tokens re-encoded per turn, 20+
+ * second stalls on a local 32K model). New sessions pick up fresh memories;
+ * the writing session already knows what it just wrote. Set
+ * BIT_MACHINE_LIVE_MEMORY=1 to restore per-turn reads.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -20,19 +30,26 @@ import { renderMemorySection } from "./prompt.ts";
 import { harnessPath, load, remove, type Scope, upsert } from "./store.ts";
 
 export default function (pi: ExtensionAPI) {
-	const liveMemory = process.env.BIT_MACHINE_LIVE_MEMORY === "1";
-	let cachedSection: string | undefined;
-	let sectionLoaded = false;
+	// `undefined` = not yet snapshotted; `null` = snapshotted as empty.
+	let frozenSection: string | null | undefined;
+
+	const loadSection = (): string | null => {
+		const cwd = process.cwd();
+		const globalMems = load(harnessPath("global", cwd)).memories;
+		const projectMems = load(harnessPath("project", cwd)).memories;
+		return renderMemorySection(globalMems, projectMems) || null;
+	};
 
 	pi.on("before_agent_start", (event) => {
-		if (!sectionLoaded || liveMemory) {
-			const cwd = process.cwd();
-			const globalMems = load(harnessPath("global", cwd)).memories;
-			const projectMems = load(harnessPath("project", cwd)).memories;
-			cachedSection = renderMemorySection(globalMems, projectMems) || undefined;
-			sectionLoaded = true;
+		let section: string | null;
+		if (process.env.BIT_MACHINE_LIVE_MEMORY === "1") {
+			section = loadSection();
+		} else {
+			if (frozenSection === undefined) {
+				frozenSection = loadSection();
+			}
+			section = frozenSection;
 		}
-		const section = cachedSection;
 		if (!section) return undefined;
 		return { systemPrompt: event.systemPrompt + section };
 	});
