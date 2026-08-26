@@ -21,7 +21,7 @@
  * solves.
  */
 
-import { execFile } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 
 const OUTPUT_CAP = 800;
 /** Predicates are gates, not builds. A slow predicate is a design smell. */
@@ -36,32 +36,100 @@ export interface Verification {
 	output: string;
 }
 
-export function runAcceptance(command: string, cwd: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Verification> {
+export function runAcceptance(
+	command: string,
+	cwd: string,
+	timeoutMs = DEFAULT_TIMEOUT_MS,
+	signal?: AbortSignal,
+): Promise<Verification> {
+	if (signal?.aborted) {
+		return Promise.resolve({ command, exitCode: null, ok: false, output: "[predicate aborted]" });
+	}
 	return new Promise((resolve) => {
-		execFile(
-			"bash",
-			["-c", command],
-			{ cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
-			(error, stdout, stderr) => {
-				const combined = `${stdout ?? ""}${stderr ? `\n${stderr}` : ""}`.trim();
-				const output =
-					combined.length > OUTPUT_CAP
-						? `${combined.slice(0, OUTPUT_CAP)}\n[... ${combined.length - OUTPUT_CAP} chars truncated]`
-						: combined;
-				if (!error) {
-					resolve({ command, exitCode: 0, ok: true, output });
-					return;
-				}
-				const code =
-					typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : null;
-				const timedOut = (error as { killed?: boolean }).killed === true && code === null;
-				resolve({
-					command,
-					exitCode: code,
-					ok: false,
-					output: timedOut ? `[predicate timed out after ${timeoutMs}ms] ${output}` : output,
-				});
+		let child: ChildProcess;
+		try {
+			child = spawn("bash", ["-c", command], {
+				cwd,
+				stdio: ["ignore", "pipe", "pipe"],
+				detached: process.platform !== "win32",
+			});
+		} catch (error) {
+			resolve({ command, exitCode: null, ok: false, output: String(error) });
+			return;
+		}
+
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		let aborted = false;
+		let settled = false;
+		let escalation: ReturnType<typeof setTimeout> | undefined;
+		const timer = setTimeout(
+			() => {
+				timedOut = true;
+				terminateProcessTree(child, "SIGTERM");
+				escalation = setTimeout(() => terminateProcessTree(child, "SIGKILL"), 200);
 			},
+			Math.max(1, timeoutMs),
 		);
+		const onAbort = () => {
+			aborted = true;
+			terminateProcessTree(child, "SIGTERM");
+			escalation = setTimeout(() => terminateProcessTree(child, "SIGKILL"), 200);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+
+		const append = (current: string, chunk: Buffer | string): string => {
+			if (current.length >= 4 * 1024 * 1024) return current;
+			return current + chunk.toString().slice(0, 4 * 1024 * 1024 - current.length);
+		};
+		child.stdout?.on("data", (chunk: Buffer | string) => {
+			stdout = append(stdout, chunk);
+		});
+		child.stderr?.on("data", (chunk: Buffer | string) => {
+			stderr = append(stderr, chunk);
+		});
+		const finish = (exitCode: number | null, spawnError?: string) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (escalation) clearTimeout(escalation);
+			signal?.removeEventListener("abort", onAbort);
+			const combined = `${stdout}${stderr ? `\n${stderr}` : ""}`.trim();
+			const output =
+				combined.length > OUTPUT_CAP
+					? `${combined.slice(0, OUTPUT_CAP)}\n[... ${combined.length - OUTPUT_CAP} chars truncated]`
+					: combined;
+			const reason = aborted
+				? `[predicate aborted]`
+				: timedOut
+					? `[predicate timed out after ${timeoutMs}ms]`
+					: spawnError;
+			resolve({
+				command,
+				exitCode,
+				ok: !reason && exitCode === 0,
+				output: reason ? `${reason}${output ? ` ${output}` : ""}` : output,
+			});
+		};
+		child.once("error", (error) => finish(null, error.message));
+		child.once("close", (code) => finish(typeof code === "number" ? code : null));
 	});
+}
+
+function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+	if (child.pid === undefined) return;
+	if (process.platform !== "win32") {
+		try {
+			process.kill(-child.pid, signal);
+			return;
+		} catch {
+			// Fall through to the direct child when group creation failed.
+		}
+	}
+	try {
+		child.kill(signal);
+	} catch {
+		// The process may already have exited.
+	}
 }

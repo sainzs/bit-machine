@@ -21,9 +21,9 @@ import {
 	SessionManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Budget, type BudgetLimits, type ExitReason, type TreeBudget } from "./budget.ts";
+import { Budget, type BudgetLimits, type ExitReason, normalizeBudgetLimits, type TreeBudget } from "./budget.ts";
 import type { RunResult } from "./envelope.ts";
-import { captureLeaseBaseline, leaseViolations, observeChanges } from "./lease.ts";
+import { captureLeaseBaseline, hasLease, leaseViolations, observeChanges, taskRequiresLease } from "./lease.ts";
 import { appendRecord, createLedger } from "./ledger.ts";
 import { MiniResourceLoader } from "./loader.ts";
 import { buildSystemPrompt, buildTaskMessage } from "./prompt.ts";
@@ -62,8 +62,12 @@ export interface RunOptions {
 }
 
 export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
+	if (taskRequiresLease(options.task) && !hasLease(options.lease)) {
+		throw new Error("Mutating tasks require a non-empty lease");
+	}
+	const limits = normalizeBudgetLimits(options.limits);
 	const ledger = createLedger(options.baseDir, options.runId);
-	const budget = new Budget(options.limits, options.tree);
+	const budget = new Budget(limits, options.tree);
 
 	// Ground truth is captured by the harness before the child exists, so the
 	// envelope's file list can come from observation rather than testimony.
@@ -79,6 +83,17 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	let submitted: SubmitDetails | undefined;
 	let sessionRef: AgentSession | undefined;
 	let stopReason: ExitReason | undefined;
+	const runController = new AbortController();
+	const verificationController = new AbortController();
+	const stopRun = (reason: ExitReason) => {
+		stopReason ??= reason;
+		budget.stop(reason);
+		if (!runController.signal.aborted) runController.abort(reason);
+		if ((reason === "wall_limit" || reason === "aborted") && !verificationController.signal.aborted) {
+			verificationController.abort(reason);
+		}
+		void sessionRef?.abort();
+	};
 
 	/**
 	 * The pre-spend gate.
@@ -96,11 +111,16 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	const gate = {
 		event: "before_provider_request",
 		handler: () => {
+			if (runController.signal.aborted) {
+				const stop = stopReason ?? (budget.elapsedMs >= budget.limits.wallMs ? "wall_limit" : "aborted");
+				stopRun(stop);
+				appendRecord(ledger.transcript, { type: "budget_stop", reason: stop, ...budget.snapshot() });
+				throw new Error(`mini-agent stopped: ${stop}`);
+			}
 			const stop = budget.checkBeforeCall();
 			if (stop) {
-				stopReason ??= stop;
+				stopRun(stop);
 				appendRecord(ledger.transcript, { type: "budget_stop", reason: stop, ...budget.snapshot() });
-				void sessionRef?.abort();
 				throw new Error(`mini-agent budget stop: ${stop}`);
 			}
 			budget.countStep();
@@ -118,7 +138,7 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	if (hasLocate) tools.push(createLocateTool(options.cwd));
 
 	const systemPrompt = buildSystemPrompt({
-		limits: options.limits,
+		limits,
 		hasLocate,
 		cwd: options.cwd,
 		lease: options.lease,
@@ -138,6 +158,21 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	});
 	sessionRef = session;
 
+	const onAbort = () => stopRun("aborted");
+	if (options.signal?.aborted) onAbort();
+	options.signal?.addEventListener("abort", onAbort, { once: true });
+	const remainingWallMs = Math.max(0, limits.wallMs - budget.elapsedMs);
+	const wallTimer = setTimeout(() => stopRun("wall_limit"), remainingWallMs);
+	if (remainingWallMs === 0) stopRun("wall_limit");
+	let cleanedUp = false;
+	const cleanup = () => {
+		if (cleanedUp) return;
+		cleanedUp = true;
+		clearTimeout(wallTimer);
+		options.signal?.removeEventListener("abort", onAbort);
+		budget.releaseReservations();
+	};
+
 	// Charge spend as it is observed, and keep a full local transcript.
 	const unsubscribe = session.subscribe((event) => {
 		if (event.type !== "message_end") return;
@@ -145,21 +180,19 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 			role?: string;
 			usage?: { cost?: { total?: number } };
 		};
-		if (message.role === "assistant" && message.usage?.cost?.total) {
+		if (message.role === "assistant" && typeof message.usage?.cost?.total === "number") {
+			// Zero-cost responses matter: they reconcile and release the reservation
+			// even when the provider reports no billable usage.
 			budget.charge(message.usage.cost.total);
 		}
 		appendRecord(ledger.transcript, { type: "message", message: event.message });
 	});
 
-	const onAbort = () => {
-		stopReason ??= "aborted";
-		void session.abort();
-	};
-	options.signal?.addEventListener("abort", onAbort, { once: true });
-
 	let error: string | undefined;
 	try {
-		await session.prompt(buildTaskMessage(options.task, options.contextPack, options.accept));
+		if (!runController.signal.aborted) {
+			await session.prompt(buildTaskMessage(options.task, options.contextPack, options.accept));
+		}
 	} catch (cause) {
 		// A budget stop surfaces here as the gate's throw; that is expected control
 		// flow, not a failure to report.
@@ -168,8 +201,15 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 			stopReason = "error";
 		}
 	} finally {
-		options.signal?.removeEventListener("abort", onAbort);
+		// Wait for provider/tool cancellation to settle before releasing the
+		// provider reservation. The same signal must remain live through acceptance.
+		try {
+			await session.abort();
+		} catch {
+			// disposal must never mask the result
+		}
 		unsubscribe();
+		budget.releaseReservations();
 		try {
 			session.dispose();
 		} catch {
@@ -177,7 +217,7 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 		}
 	}
 
-	let exitReason: ExitReason = submitted ? "submitted" : (budget.tripped ?? stopReason ?? "error");
+	let exitReason: ExitReason = budget.tripped ?? stopReason ?? (submitted ? "submitted" : "error");
 
 	// A dead model binding fails on the FIRST provider call with an auth/config
 	// error. Without this classification it reads as a generic "error" — or
@@ -188,36 +228,57 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 		exitReason = "binding_error";
 	}
 
-	// Observation before testimony: what actually changed on disk.
-	const changes = await observeChanges(options.cwd, leaseBaseline);
-	const claimed = submitted?.filesChanged ?? [];
-	const observed = changes.observed;
-	const violations = observed !== undefined ? leaseViolations(observed, options.lease ?? []) : [];
+	try {
+		// Observation before testimony: what actually changed on disk.
+		const changes = await observeChanges(options.cwd, leaseBaseline);
+		const claimed = submitted?.filesChanged ?? [];
+		const observed = changes.observed;
+		const violations = observed !== undefined ? leaseViolations(observed, options.lease ?? []) : [];
 
-	// The caller's definition of done, run by the harness, after the child is gone.
-	const verification = options.accept ? await runAcceptance(options.accept, options.cwd) : undefined;
-	if (verification) {
-		appendRecord(ledger.transcript, { type: "verification", ...verification });
+		// The caller's definition of done, run by the harness, after the child is gone.
+		// Step/cost/tree exhaustion stops the child loop, but the caller's
+		// acceptance predicate is still useful for reporting a partial result.
+		// Wall-clock and external cancellation remain abortable so verification
+		// cannot outlive the run's hard time boundary.
+		const verification = options.accept
+			? await runAcceptance(
+					options.accept,
+					options.cwd,
+					Math.min(30_000, Math.max(1, limits.wallMs - budget.elapsedMs)),
+					verificationController.signal,
+				)
+			: undefined;
+		if (verification) {
+			appendRecord(ledger.transcript, { type: "verification", ...verification });
+		}
+		if (budget.elapsedMs >= limits.wallMs && stopReason === undefined) {
+			stopRun("wall_limit");
+		}
+		exitReason = budget.tripped ?? stopReason ?? exitReason;
+
+		const result: RunResult = {
+			exitReason,
+			summary: submitted?.summary ?? fallbackSummary(session, exitReason),
+			filesChanged: observed ?? claimed,
+			filesChangedSource: observed !== undefined ? "observed" : claimed.length > 0 ? "claimed" : "none",
+			claimedFilesChanged: claimed,
+			...(verification ? { verification } : {}),
+			...(violations.length > 0 ? { leaseViolations: violations } : {}),
+			budget: budget.snapshot(),
+			ledgerDir: ledger.dir,
+			steps: budget.steps,
+			costUsd: budget.usd,
+			...(error ? { error } : {}),
+			...(changes.unverifiable
+				? { error: [error, `[lease] ${changes.unverifiable}`].filter(Boolean).join("; ") }
+				: {}),
+		};
+
+		appendRecord(ledger.transcript, { type: "result", result });
+		return result;
+	} finally {
+		cleanup();
 	}
-
-	const result: RunResult = {
-		exitReason,
-		summary: submitted?.summary ?? fallbackSummary(session, exitReason),
-		filesChanged: observed ?? claimed,
-		filesChangedSource: observed !== undefined ? "observed" : claimed.length > 0 ? "claimed" : "none",
-		claimedFilesChanged: claimed,
-		...(verification ? { verification } : {}),
-		...(violations.length > 0 ? { leaseViolations: violations } : {}),
-		budget: budget.snapshot(),
-		ledgerDir: ledger.dir,
-		steps: budget.steps,
-		costUsd: budget.usd,
-		...(error ? { error } : {}),
-		...(changes.unverifiable ? { error: [error, `[lease] ${changes.unverifiable}`].filter(Boolean).join("; ") } : {}),
-	};
-
-	appendRecord(ledger.transcript, { type: "result", result });
-	return result;
 }
 
 /** Signatures of a dead/misconfigured model binding on the first call. */

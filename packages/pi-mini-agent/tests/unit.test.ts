@@ -6,7 +6,9 @@ import { test } from "node:test";
 import { Budget, DEFAULT_LIMITS, TreeBudget } from "../src/budget.ts";
 import { formatEnvelope, isFailure, type RunResult } from "../src/envelope.ts";
 import { createLedger, recordObservation } from "../src/ledger.ts";
-import { extractLocations } from "../src/tools.ts";
+import { createLocateTool, createShTool, createSubmitTool, extractLocations } from "../src/tools.ts";
+import { taskRequiresLease } from "../src/lease.ts";
+import { runMiniAgent } from "../src/runner.ts";
 
 const limits = { steps: 5, usd: 1, wallMs: 60_000 };
 
@@ -19,6 +21,7 @@ test("budget stops on the step limit before spending, not after", () => {
 	for (let i = 0; i < limits.steps; i++) {
 		assert.equal(b.checkBeforeCall(), undefined, `step ${i + 1} should be allowed`);
 		b.countStep();
+		b.charge(0);
 	}
 	// The (limit+1)th call must be refused rather than merely reported afterwards.
 	assert.equal(b.checkBeforeCall(), "step_limit");
@@ -27,25 +30,57 @@ test("budget stops on the step limit before spending, not after", () => {
 });
 
 test("a shared tree ceiling stops runs that are each within their own budget", () => {
-	// The point of the tree ceiling: a fan-out where no single run misbehaves can
-	// still spend an unacceptable amount in aggregate.
-	const tree = new TreeBudget(1.2);
-	const a = new Budget(limits, tree);
-	const b = new Budget(limits, tree);
+	// A reservation is held while the provider call is in flight. A sibling
+	// cannot start unless its entire possible spend also fits the remaining pool.
+	const tree = new TreeBudget(1);
+	const a = new Budget({ ...limits, usd: 0.6 }, tree);
+	const b = new Budget({ ...limits, usd: 0.6 }, tree);
 
-	a.charge(0.6);
 	assert.equal(a.checkBeforeCall(), undefined);
-	assert.equal(tree.exhausted, false);
-
-	b.charge(0.6);
-	assert.equal(tree.spentUsd, 1.2);
-	assert.equal(tree.exhausted, true);
-
-	// Both runs stop, even though each spent only $0.60 of its own $1 limit.
-	assert.equal(a.usd, 0.6);
-	assert.equal(b.usd, 0.6);
-	assert.equal(a.checkBeforeCall(), "tree_budget");
+	a.countStep();
+	assert.equal(tree.reservedUsd, 0.6);
 	assert.equal(b.checkBeforeCall(), "tree_budget");
+	assert.equal(tree.reservedUsd, 0.6);
+
+	// Reconciling actual usage releases the unused reservation and makes the
+	// remaining tree allowance available to the sibling.
+	a.charge(0.2);
+	assert.equal(tree.spentUsd, 0.2);
+	assert.equal(tree.reservedUsd, 0);
+	assert.equal(b.checkBeforeCall(), undefined);
+	b.countStep();
+	b.charge(0.3);
+	assert.equal(tree.spentUsd, 0.5);
+	assert.equal(tree.reservedUsd, 0);
+	assert.equal(tree.exhausted, false);
+});
+
+test("a reservation is released when an in-flight call has no usage", () => {
+	const tree = new TreeBudget(1);
+	const b = new Budget({ ...limits, usd: 0.75 }, tree);
+	assert.equal(b.checkBeforeCall(), undefined);
+	b.countStep();
+	assert.equal(tree.reservedUsd, 0.75);
+	b.charge(0);
+	assert.equal(tree.spentUsd, 0);
+	assert.equal(tree.reservedUsd, 0);
+});
+
+test("shared tree reservations prevent concurrent runs from overspending the ceiling", () => {
+	const tree = new TreeBudget(1);
+	const a = new Budget({ ...limits, usd: 1 }, tree);
+	const b = new Budget({ ...limits, usd: 0.19 }, tree);
+
+	assert.equal(a.checkBeforeCall(), undefined);
+	assert.equal(tree.reservedUsd, 1);
+	assert.equal(b.checkBeforeCall(), "tree_budget");
+
+	a.charge(0.8);
+	assert.equal(tree.spentUsd, 0.8);
+	assert.equal(tree.reservedUsd, 0);
+	assert.equal(b.checkBeforeCall(), undefined);
+	b.charge(0.19);
+	assert.equal(tree.spentUsd, 0.99);
 });
 
 test("a run's own cost limit takes precedence over the tree ceiling", () => {
@@ -88,6 +123,14 @@ test("charge ignores junk rather than corrupting the ledger", () => {
 	assert.equal(b.usd, 0);
 });
 
+test("malformed limits fail closed instead of disabling budget guards", () => {
+	const b = new Budget(
+		{ steps: Number.NaN, usd: Number.POSITIVE_INFINITY, wallMs: Number.NaN },
+		new TreeBudget(10),
+	);
+	assert.equal(b.checkBeforeCall(), "step_limit");
+});
+
 test("short observations are passed through untouched", () => {
 	const dir = mkdtempSync(join(tmpdir(), "mini-ledger-"));
 	const ledger = createLedger(dir, "r1");
@@ -110,10 +153,69 @@ test("long observations are elided in context but kept whole on disk", () => {
 	assert.ok(digest.endsWith("B".repeat(100)), "tail is preserved");
 
 	const [file] = readdirSync(join(ledger.dir, "obs"));
-	assert.equal(file, "007.txt", "observation file is named by step");
+	assert.match(file ?? "", /^007-\d{3}-output\.txt$/, "observation file includes step and unique id");
 	const stored = readFileSync(join(ledger.dir, "obs", file), "utf-8");
 	assert.equal(stored, raw, "the full output must survive verbatim");
 	assert.ok(stored.includes("NEEDLE"), "the elided middle is recoverable");
+});
+
+test("same-step observations get distinct files and retain both payloads", () => {
+	const dir = mkdtempSync(join(tmpdir(), "mini-ledger-same-step-"));
+	const ledger = createLedger(dir, "r3");
+	const first = "first".repeat(2_000);
+	const second = "second".repeat(2_000);
+
+	const firstDigest = recordObservation(ledger, 4, first, "call-a");
+	const secondDigest = recordObservation(ledger, 4, second, "call-b");
+	const files = readdirSync(join(ledger.dir, "obs")).sort();
+
+	assert.deepEqual(files, ["004-000-call-a.txt", "004-001-call-b.txt"]);
+	assert.match(firstDigest, /004-000-call-a\.txt/);
+	assert.match(secondDigest, /004-001-call-b\.txt/);
+	assert.equal(readFileSync(join(ledger.dir, "obs", files[0]), "utf8"), first);
+	assert.equal(readFileSync(join(ledger.dir, "obs", files[1]), "utf8"), second);
+});
+
+test("mini action tools opt into the SDK's sequential execution mode", () => {
+	const dir = mkdtempSync(join(tmpdir(), "mini-tools-"));
+	const b = budget();
+	const ledger = createLedger(dir, "r4");
+	assert.equal(createShTool({ cwd: dir, budget: b, ledger }).executionMode, "sequential");
+	assert.equal(createSubmitTool(() => {}).executionMode, "sequential");
+	assert.equal(createLocateTool(dir).executionMode, "sequential");
+});
+
+test("mutating task descriptions require a lease while inspection tasks do not", () => {
+	assert.equal(taskRequiresLease("Fix the retry and update the test"), true);
+	assert.equal(taskRequiresLease("Inspect the retry behavior and report findings"), false);
+	assert.equal(taskRequiresLease("Do not create or modify any file; submit a report"), false);
+});
+
+test("the runner refuses a mutating task with an omitted or empty lease", async () => {
+	const options = {
+		task: "Modify the implementation",
+		cwd: tmpdir(),
+		limits,
+		tree: new TreeBudget(10),
+		baseDir: mkdtempSync(join(tmpdir(), "mini-runner-")),
+		runId: "missing-lease",
+		retrieval: "off" as const,
+	};
+	await assert.rejects(runMiniAgent(options), /non-empty lease/);
+	await assert.rejects(runMiniAgent({ ...options, lease: ["", "  "] }), /non-empty lease/);
+});
+
+test("long observations from one step receive distinct files", () => {
+	const dir = mkdtempSync(join(tmpdir(), "mini-ledger-concurrent-"));
+	const ledger = createLedger(dir, "r3");
+	const first = recordObservation(ledger, 2, "x".repeat(8_000), "call/one");
+	const second = recordObservation(ledger, 2, "y".repeat(8_000), "call/two");
+	assert.match(first, /call_one\.txt/);
+	assert.match(second, /call_two\.txt/);
+	assert.deepEqual(readdirSync(join(ledger.dir, "obs")).sort(), [
+		"002-000-call_one.txt",
+		"002-001-call_two.txt",
+	]);
 });
 
 test("locate strips scout's preamble and code, keeping only locations", () => {

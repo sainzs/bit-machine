@@ -27,24 +27,50 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { DEFAULT_LIMITS, TreeBudget } from "./budget.ts";
 import { formatEnvelope, isFailure } from "./envelope.ts";
+import { hasLease, taskRequiresLease } from "./lease.ts";
 import { auditSummon } from "./ledger.ts";
 import { runMiniAgent } from "./runner.ts";
 
 const DEPTH_ENV = "PI_MINI_DEPTH";
-const MAX_DEPTH = Number(process.env.PI_MINI_MAX_DEPTH ?? 1);
-const MAX_CONCURRENCY = Number(process.env.PI_MINI_CONCURRENCY ?? 2);
+function readFiniteEnvNumber(
+	name: string,
+	fallback: number,
+	options: { minimum: number; maximum?: number; integer?: boolean },
+	invalidFallback = fallback,
+): number {
+	const raw = process.env[name]?.trim();
+	if (!raw) return invalidFallback;
+	const value = Number(raw);
+	if (
+		!Number.isFinite(value) ||
+		value < options.minimum ||
+		(options.maximum !== undefined && value > options.maximum) ||
+		(options.integer && !Number.isInteger(value))
+	) {
+		return invalidFallback;
+	}
+	return value;
+}
+
+const MAX_DEPTH = readFiniteEnvNumber("PI_MINI_MAX_DEPTH", 1, { minimum: 0, maximum: 100, integer: true });
+const MAX_CONCURRENCY = readFiniteEnvNumber("PI_MINI_CONCURRENCY", 2, { minimum: 1, maximum: 1024, integer: true });
 /** Ceiling shared by every run summoned from this process. */
-const TREE_CEILING_USD = Number(process.env.PI_MINI_TREE_USD ?? 25);
+const TREE_CEILING_USD = readFiniteEnvNumber("PI_MINI_TREE_USD", 25, { minimum: 0.01, maximum: 1_000_000 });
 
 const BASE_DIR = join(homedir(), ".pi", "agent", "mini-agent");
 
-const currentDepth = Number(process.env[DEPTH_ENV] ?? 0);
+const currentDepth = readFiniteEnvNumber(DEPTH_ENV, 0, { minimum: 0, maximum: 100, integer: true }, MAX_DEPTH);
 const treeBudget = new TreeBudget(TREE_CEILING_USD);
 
 /** Simple FIFO semaphore. */
 class Semaphore {
 	private active = 0;
-	private readonly waiting: Array<() => void> = [];
+	private readonly waiting: Array<{
+		resolve: (release: () => void) => void;
+		reject: (error: unknown) => void;
+		signal?: AbortSignal;
+		onAbort?: () => void;
+	}> = [];
 
 	private readonly limit: number;
 
@@ -52,18 +78,45 @@ class Semaphore {
 		this.limit = limit;
 	}
 
-	async acquire(): Promise<() => void> {
-		if (this.active >= this.limit) {
-			await new Promise<void>((resolve) => this.waiting.push(resolve));
+	async acquire(signal?: AbortSignal): Promise<() => void> {
+		if (signal?.aborted) throw signal.reason ?? new Error("Operation aborted");
+		return new Promise<() => void>((resolve, reject) => {
+			const waiter: {
+				resolve: (release: () => void) => void;
+				reject: (error: unknown) => void;
+				signal?: AbortSignal;
+				onAbort?: () => void;
+			} = { resolve, reject, signal };
+			const onAbort = () => {
+				const index = this.waiting.indexOf(waiter);
+				if (index !== -1) this.waiting.splice(index, 1);
+				reject(signal?.reason ?? new Error("Operation aborted"));
+			};
+			waiter.onAbort = onAbort;
+			if (signal) signal.addEventListener("abort", onAbort, { once: true });
+			this.waiting.push(waiter);
+			this.pump();
+		});
+	}
+
+	private pump(): void {
+		while (this.active < this.limit) {
+			const waiter = this.waiting.shift();
+			if (!waiter) return;
+			if (waiter.signal?.aborted) {
+				waiter.onAbort?.();
+				continue;
+			}
+			if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+			this.active++;
+			let released = false;
+			waiter.resolve(() => {
+				if (released) return;
+				released = true;
+				this.active--;
+				this.pump();
+			});
 		}
-		this.active++;
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			this.active--;
-			this.waiting.shift()?.();
-		};
 	}
 }
 
@@ -158,7 +211,18 @@ export default function (pi: ExtensionAPI) {
 				wallMs: (params.minutes ?? DEFAULT_LIMITS.wallMs / 60000) * 60_000,
 			};
 
-			if (treeBudget.exhausted) {
+			if (taskRequiresLease(params.task) && !hasLease(params.lease)) {
+				return {
+					content: [{ type: "text" as const, text: "Refused: mutating tasks require a non-empty lease." }],
+					details: undefined,
+					isError: true,
+				};
+			}
+
+			// A reservation belongs to an in-flight provider call, not to the whole
+			// summon. Let queued/concurrent summons reach the per-call gate so an
+			// unused reservation can be reconciled before refusing the next call.
+			if (treeBudget.spentUsd >= treeBudget.ceilingUsd) {
 				return {
 					content: [
 						{
@@ -176,14 +240,14 @@ export default function (pi: ExtensionAPI) {
 
 			const controller = new AbortController();
 			live.add(controller);
-			signal?.addEventListener("abort", () => controller.abort(), { once: true });
-
-			const previousDepth = process.env[DEPTH_ENV];
-			const release = await semaphore.acquire();
+			const onAbort = () => controller.abort();
+			if (signal?.aborted) controller.abort();
+			signal?.addEventListener("abort", onAbort, { once: true });
 			const startedAt = Date.now();
+			let release: (() => void) | undefined;
 
 			try {
-				process.env[DEPTH_ENV] = String(currentDepth + 1);
+				release = await semaphore.acquire(controller.signal);
 				onUpdate?.({ content: [{ type: "text", text: `mini ${runId}: starting` }], details: undefined });
 
 				const result = await runMiniAgent({
@@ -245,10 +309,9 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			} finally {
-				release();
+				signal?.removeEventListener("abort", onAbort);
+				release?.();
 				live.delete(controller);
-				if (previousDepth === undefined) delete process.env[DEPTH_ENV];
-				else process.env[DEPTH_ENV] = previousDepth;
 			}
 		},
 	});

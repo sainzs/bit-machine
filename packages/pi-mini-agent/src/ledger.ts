@@ -31,12 +31,14 @@ export interface RunLedger {
 	dir: string;
 	/** Absolute path of the NDJSON transcript for this run. */
 	transcript: string;
+	/** Monotonic sequence so concurrent tool results never share an observation path. */
+	observationSequence: number;
 }
 
 export function createLedger(baseDir: string, runId: string): RunLedger {
 	const dir = join(baseDir, "runs", runId);
 	mkdirSync(join(dir, "obs"), { recursive: true });
-	return { runId, dir, transcript: join(dir, "transcript.ndjson") };
+	return { runId, dir, transcript: join(dir, "transcript.ndjson"), observationSequence: 0 };
 }
 
 /**
@@ -45,10 +47,17 @@ export function createLedger(baseDir: string, runId: string): RunLedger {
  * The elision marker states the exact number of dropped characters and the file
  * to read, which is what makes it actionable rather than merely honest.
  */
-export function recordObservation(ledger: RunLedger, step: number, raw: string): string {
+export function recordObservation(ledger: RunLedger, step: number, raw: string, observationId?: string): string {
 	if (raw.length <= ELIDE_THRESHOLD) return raw;
 
-	const path = join(ledger.dir, "obs", `${String(step).padStart(3, "0")}.txt`);
+	const sequence = ledger.observationSequence++;
+	const safeId = observationId?.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80) || "output";
+	const stepName = String(step).padStart(3, "0");
+	// Include both a monotonic sequence and the tool-call id. Results from two
+	// parallel blocks (or two calls in one model step) must never overwrite one
+	// another, and the name should identify the source when the agent re-reads it.
+	const name = `${stepName}-${String(sequence).padStart(3, "0")}-${safeId}.txt`;
+	const path = join(ledger.dir, "obs", name);
 	try {
 		writeFileSync(path, raw, "utf-8");
 	} catch {

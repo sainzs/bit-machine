@@ -8,8 +8,8 @@
  * So the envelope's `filesChanged` must come from observation, not testimony.
  *
  * Mechanism: when `cwd` is inside a git work tree, fingerprint the dirty set
- * before the run (`git status --porcelain -z`, plus size+mtime of each dirty
- * path) and diff it after. A file counts as changed when it enters/leaves the
+ * before the run (`git status --porcelain -z`, plus a content hash for each
+ * dirty file) and diff it after. A file counts as changed when it enters/leaves the
  * porcelain set or its fingerprint moves. This is detection, not prevention —
  * a lease violation fails the run's envelope; it does not block the write.
  * Prevention would need a sandbox and would cost the in-process architecture.
@@ -24,7 +24,8 @@
  */
 
 import { execFile } from "node:child_process";
-import { statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -59,15 +60,21 @@ function porcelainPaths(raw: string): string[] {
 		const status = field.slice(0, 2);
 		out.push(field.slice(3));
 		// Rename/copy entries carry the original path in the next NUL field.
-		if (status[0] === "R" || status[0] === "C") i++;
+		if (status[0] === "R" || status[0] === "C") {
+			const original = fields[i + 1];
+			if (original) out.push(original);
+			i++;
+		}
 	}
 	return out;
 }
 
 function fingerprint(root: string, rel: string): string {
 	try {
-		const s = statSync(join(root, rel));
-		return `${s.size}:${Math.round(s.mtimeMs)}`;
+		const absolute = join(root, rel);
+		const s = statSync(absolute);
+		if (s.isFile()) return `file:${s.size}:${createHash("sha256").update(readFileSync(absolute)).digest("hex")}`;
+		return `other:${s.size}:${Math.round(s.mtimeMs)}:${s.mode}`;
 	} catch {
 		return "absent";
 	}
@@ -129,20 +136,66 @@ export function leaseMatch(pattern: string, path: string): boolean {
 		const p = pattern.replace(/\/+$/, "");
 		return path === p || path.startsWith(`${p}/`);
 	}
-	const rx = pattern
-		.split("**")
-		.map((part) =>
-			part
-				.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-				.replace(/\*/g, "[^/]*")
-				.replace(/\?/g, "[^/]"),
-		)
-		.join(".*");
-	return new RegExp(`^${rx}$`).test(path);
+	let rx = "^";
+	for (let i = 0; i < pattern.length; i++) {
+		const char = pattern[i];
+		if (char === "*" && pattern[i + 1] === "*") {
+			i++;
+			if (pattern[i + 1] === "/") {
+				rx += "(?:.*/)?";
+				i++;
+			} else {
+				rx += ".*";
+			}
+			continue;
+		}
+		if (char === "*") {
+			rx += "[^/]*";
+			continue;
+		}
+		if (char === "?") {
+			rx += "[^/]";
+			continue;
+		}
+		rx += /[.+^${}()|[\]\\]/.test(char) ? `\\${char}` : char;
+	}
+	return new RegExp(`${rx}$`).test(path);
+}
+
+const MUTATION_WORDS =
+	"create|add|write|modify|edit|update|change|fix|implement|refactor|delete|remove|rename|move|replace|patch|touch|mkdir|generate|commit";
+const MUTATION_RX = new RegExp(`\\b(?:${MUTATION_WORDS})\\b`, "gi");
+const NEGATED_MUTATION_PREFIX_RX = /\b(?:do not|don't|never|without|avoid)\b[\s\w,/'-]*$/i;
+const READ_ONLY_RX =
+	/\b(?:read|inspect|review|audit|analy[sz]e|explain|find|search|locate|list|count|check|verify|reproduce|diagnose|report|summarize|describe|no changes?|read-only|do not|don't|never|without|avoid)\b/i;
+
+/** Whether the task description requires a write-set lease to be supplied. */
+export function taskRequiresLease(task: string): boolean {
+	const matches = [...task.matchAll(MUTATION_RX)];
+	if (
+		matches.some((match) => {
+			const index = match.index ?? 0;
+			const boundary = Math.max(
+				task.lastIndexOf(";", index),
+				task.lastIndexOf(".", index),
+				task.lastIndexOf("\n", index),
+			);
+			return !NEGATED_MUTATION_PREFIX_RX.test(task.slice(boundary + 1, index));
+		})
+	)
+		return true;
+	return !READ_ONLY_RX.test(task);
+}
+
+/** A lease containing at least one non-blank pattern. */
+export function hasLease(lease: readonly string[] | undefined): boolean {
+	return lease?.some((pattern) => pattern.trim().length > 0) === true;
 }
 
 /** Paths in `observed` that no lease pattern licenses. */
 export function leaseViolations(observed: string[], lease: string[]): string[] {
-	if (lease.length === 0) return [];
+	// An omitted lease is the explicit read-only mode. Any observed net change is
+	// therefore a violation, rather than silently turning off the guard.
+	if (lease.length === 0) return [...observed];
 	return observed.filter((path) => !lease.some((pattern) => leaseMatch(pattern, path)));
 }

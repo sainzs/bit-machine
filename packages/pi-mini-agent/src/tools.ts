@@ -62,6 +62,7 @@ export function createShTool(input: ShToolInput): ToolDefinition {
 		...base,
 		name: "sh",
 		label: "sh",
+		executionMode: "sequential",
 		description:
 			"Run one shell command in the working directory and return its output. " +
 			`Always pass \`timeout\` for builds, tests and installs; it defaults to ${DEFAULT_SH_TIMEOUT_SECONDS}s. ` +
@@ -82,7 +83,7 @@ export function createShTool(input: ShToolInput): ToolDefinition {
 			// model can choose to submit rather than be cut off.
 			const content = (result.content ?? []).map((block) => {
 				if (block.type !== "text") return block;
-				return { ...block, text: recordObservation(ledger, budget.steps, block.text) };
+				return { ...block, text: recordObservation(ledger, budget.steps, block.text, toolCallId) };
 			});
 
 			const warning = budget.warningLine();
@@ -109,6 +110,7 @@ export function createSubmitTool(onSubmit: (details: SubmitDetails) => void): To
 	return defineTool({
 		name: "submit",
 		label: "submit",
+		executionMode: "sequential",
 		description:
 			"Report your final result and end the run. Call this exactly once, as your last action. " +
 			"If you are out of budget, submit whatever you have verified so far rather than nothing.",
@@ -183,6 +185,7 @@ export function createLocateTool(cwd: string): ToolDefinition {
 	return defineTool({
 		name: "locate",
 		label: "locate",
+		executionMode: "sequential",
 		description:
 			"Semantic search of this repository. Returns `path:startLine-endLine` locations only — read " +
 			"them with `sh`. Use when you do not know where something lives; use `sh` with `rg` when you " +

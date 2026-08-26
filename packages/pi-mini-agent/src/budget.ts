@@ -42,29 +42,73 @@ export const DEFAULT_LIMITS: BudgetLimits = {
 	wallMs: 20 * 60 * 1000,
 };
 
+/** Normalize caller-supplied limits so non-finite values always fail closed. */
+export function normalizeBudgetLimits(limits: BudgetLimits): BudgetLimits {
+	return {
+		steps: finiteNonNegativeInteger(limits.steps),
+		usd: finiteNonNegative(limits.usd),
+		wallMs: finiteNonNegative(limits.wallMs),
+	};
+}
+
 /**
  * A budget shared by a whole tree of summoned runs.
  *
- * Deliberately in-process and lock-free: every run is a nested
- * `AgentSession` on one event loop, so a module-scoped object is race-free.
- * A file-based ledger would only be needed if we spawned children — which is
- * one more reason not to (see PLAN.md D2).
+ * Deliberately in-process. Reservations make the shared ceiling safe even when
+ * sibling runs reach the provider gate in the same turn: a run must reserve its
+ * remaining allowance before the request begins, then settle that reservation
+ * with the provider's observed cost.
  */
 export class TreeBudget {
 	readonly ceilingUsd: number;
 	spentUsd = 0;
+	private reserved = 0;
+	private readonly reservations = new Set<TreeReservation>();
 
 	constructor(ceilingUsd: number) {
+		if (!Number.isFinite(ceilingUsd) || ceilingUsd < 0) {
+			throw new RangeError(`tree budget ceiling must be a finite non-negative number, got ${ceilingUsd}`);
+		}
 		this.ceilingUsd = ceilingUsd;
 	}
 
 	get remainingUsd(): number {
-		return Math.max(0, this.ceilingUsd - this.spentUsd);
+		return Math.max(0, this.ceilingUsd - this.spentUsd - this.reserved);
 	}
 
 	get exhausted(): boolean {
-		return this.spentUsd >= this.ceilingUsd;
+		return this.remainingUsd <= 0;
 	}
+
+	/** Amount currently held by in-flight provider requests. */
+	get reservedUsd(): number {
+		return this.reserved;
+	}
+
+	/** Reserve an allowance before starting a provider request. */
+	reserve(amountUsd: number): TreeReservation | undefined {
+		if (!Number.isFinite(amountUsd) || amountUsd <= 0 || amountUsd > this.remainingUsd) return undefined;
+		const reservation = { amountUsd };
+		this.reservations.add(reservation);
+		this.reserved += amountUsd;
+		return reservation;
+	}
+
+	/** Release an allowance and charge the observed provider cost. */
+	settle(reservation: TreeReservation, actualUsd = 0): void {
+		if (!this.reservations.delete(reservation)) return;
+		this.reserved = Math.max(0, this.reserved - reservation.amountUsd);
+		if (Number.isFinite(actualUsd) && actualUsd > 0) this.spentUsd += actualUsd;
+	}
+
+	/** Charge an observed cost that was not preceded by a reservation. */
+	record(actualUsd: number): void {
+		if (Number.isFinite(actualUsd) && actualUsd > 0) this.spentUsd += actualUsd;
+	}
+}
+
+export interface TreeReservation {
+	readonly amountUsd: number;
 }
 
 export interface BudgetSnapshot {
@@ -81,6 +125,7 @@ export class Budget {
 	readonly limits: BudgetLimits;
 	readonly startedAt = Date.now();
 	private readonly tree: TreeBudget;
+	private readonly reservations: TreeReservation[] = [];
 
 	steps = 0;
 	usd = 0;
@@ -88,7 +133,9 @@ export class Budget {
 	tripped: ExitReason | undefined;
 
 	constructor(limits: BudgetLimits, tree: TreeBudget) {
-		this.limits = limits;
+		// Malformed numeric input must fail closed. Comparisons against NaN are
+		// always false, which would otherwise disable every gate.
+		this.limits = normalizeBudgetLimits(limits);
 		this.tree = tree;
 	}
 
@@ -111,12 +158,30 @@ export class Budget {
 		if (this.usd >= this.limits.usd) return this.trip("cost_limit");
 		if (this.elapsedMs >= this.limits.wallMs) return this.trip("wall_limit");
 		if (this.tree.exhausted) return this.trip("tree_budget");
+		// Hold the whole remaining per-run allowance while this request is in
+		// flight. The provider's actual cost is unknown at this point; reserving
+		// only the tree's currently available fraction would let a request spend
+		// past the shared ceiling before its response reconciles the ledger.
+		const allowance = this.limits.usd - this.usd - this.reservedUsd;
+		if (allowance <= 0) return this.trip("cost_limit");
+		// A partial reservation would be unsound: two requests could each reserve
+		// the currently available fraction and then each spend their full local
+		// allowance. Refuse the request unless the whole possible spend fits in the
+		// shared pool.
+		const reservation = this.tree.reserve(allowance);
+		if (!reservation) return this.trip("tree_budget");
+		this.reservations.push(reservation);
 		return undefined;
 	}
 
 	private trip(reason: ExitReason): ExitReason {
 		this.tripped ??= reason;
 		return reason;
+	}
+
+	/** Stop an in-flight run from an external wall-clock or cancellation guard. */
+	stop(reason: ExitReason): void {
+		this.trip(reason);
 	}
 
 	/** Count a model call that is about to be made. */
@@ -126,9 +191,23 @@ export class Budget {
 
 	/** Charge observed spend to this run and to the shared tree ceiling. */
 	charge(usd: number): void {
-		if (!Number.isFinite(usd) || usd <= 0) return;
+		const reservation = this.reservations.shift();
+		if (!Number.isFinite(usd) || usd <= 0) {
+			if (reservation) this.tree.settle(reservation);
+			return;
+		}
 		this.usd += usd;
-		this.tree.spentUsd += usd;
+		if (reservation) this.tree.settle(reservation, usd);
+		else this.tree.record(usd);
+	}
+
+	/** Release requests that ended without a usage event. */
+	releaseReservations(): void {
+		for (const reservation of this.reservations.splice(0)) this.tree.settle(reservation);
+	}
+
+	private get reservedUsd(): number {
+		return this.reservations.reduce((total, reservation) => total + reservation.amountUsd, 0);
 	}
 
 	snapshot(): BudgetSnapshot {
@@ -162,4 +241,12 @@ export class Budget {
 		}
 		return undefined;
 	}
+}
+
+function finiteNonNegative(value: number): number {
+	return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function finiteNonNegativeInteger(value: number): number {
+	return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -32,6 +32,16 @@ test("a hung predicate is killed, not waited on", async () => {
 	assert.match(v.output, /timed out/);
 });
 
+test("an aborted predicate is killed through its signal", async () => {
+	const controller = new AbortController();
+	const pending = runAcceptance("while :; do :; done", tmpdir(), 30_000, controller.signal);
+	setTimeout(() => controller.abort(), 20);
+	const v = await pending;
+	assert.equal(v.ok, false);
+	assert.equal(v.exitCode, null);
+	assert.match(v.output, /predicate aborted/);
+});
+
 test("predicate runs in the declared cwd", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "mini-accept-"));
 	writeFileSync(join(dir, "artifact.txt"), "x");
@@ -53,6 +63,7 @@ test("a bare path licenses itself and its subtree, nothing else", () => {
 test("glob patterns match within and across segments correctly", () => {
 	assert.equal(leaseMatch("src/*.ts", "src/a.ts"), true);
 	assert.equal(leaseMatch("src/*.ts", "src/deep/a.ts"), false);
+	assert.equal(leaseMatch("src/**/*.ts", "src/a.ts"), true);
 	assert.equal(leaseMatch("src/**/*.ts", "src/deep/er/a.ts"), true);
 	assert.equal(leaseMatch("docs/w?.md", "docs/w8.md"), true);
 	assert.equal(leaseMatch("docs/w?.md", "docs/w88.md"), false);
@@ -61,8 +72,8 @@ test("glob patterns match within and across segments correctly", () => {
 test("violations are exactly the unlicensed observed paths", () => {
 	const observed = ["src/http/retry.ts", "README.md", "src/http/retry.test.ts"];
 	assert.deepEqual(leaseViolations(observed, ["src/http/**"]), ["README.md"]);
-	// No lease declared = read-only work assumed elsewhere; nothing to violate.
-	assert.deepEqual(leaseViolations(observed, []), []);
+	// No lease declared = read-only work; any observed net change is a violation.
+	assert.deepEqual(leaseViolations(observed, []), observed);
 });
 
 // ---------------------------------------------------------------------------
@@ -82,12 +93,13 @@ function tempRepo(): string {
 	return dir;
 }
 
-test("observation sees a new file and a modified tracked file; claims are irrelevant", async () => {
+test("observation sees same-sized content edits and new files; claims are irrelevant", async () => {
 	const dir = tempRepo();
 	const baseline = await captureLeaseBaseline(dir);
 	assert.equal(baseline.git, true);
 
-	writeFileSync(join(dir, "tracked.txt"), "changed\n");
+	// Keep the byte length unchanged so size/mtime fingerprints cannot hide this edit.
+	writeFileSync(join(dir, "tracked.txt"), "modified\n");
 	writeFileSync(join(dir, "new.txt"), "hello\n");
 
 	const { observed } = await observeChanges(dir, baseline);
@@ -103,6 +115,24 @@ test("a file dirty before the run and untouched by it is NOT attributed to the c
 
 	const { observed } = await observeChanges(dir, baseline);
 	assert.deepEqual(observed, ["child.txt"]);
+});
+
+test("observation reports both sides of a rename", async () => {
+	const dir = tempRepo();
+	const baseline = await captureLeaseBaseline(dir);
+	execFileSync("git", ["mv", "tracked.txt", "renamed.txt"], { cwd: dir });
+
+	const { observed } = await observeChanges(dir, baseline);
+	assert.deepEqual(observed, ["renamed.txt", "tracked.txt"]);
+});
+
+test("observation reports a clean tracked file deleted during the run", async () => {
+	const dir = tempRepo();
+	const baseline = await captureLeaseBaseline(dir);
+	unlinkSync(join(dir, "tracked.txt"));
+
+	const { observed } = await observeChanges(dir, baseline);
+	assert.deepEqual(observed, ["tracked.txt"]);
 });
 
 test("outside a git repo, observation reports itself impossible instead of guessing", async () => {

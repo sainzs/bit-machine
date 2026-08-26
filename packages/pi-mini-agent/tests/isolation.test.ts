@@ -31,20 +31,31 @@ writeFileSync(
 after(() => rmSync(agentDir, { recursive: true, force: true }));
 
 test("pi's default discovery would load ambient extensions into a nested session", async () => {
-	const settingsManager = SettingsManager.create(cwd, agentDir);
-	const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
-	await loader.reload();
+	// Use a temporary user resource instead of the developer's real home. The test
+	// must keep proving the default loader's hazard when `test.sh` runs with an
+	// intentionally empty HOME.
+	const root = mkdtempSync(join(tmpdir(), "pi-mini-isolation-"));
+	const agentDir = join(root, "agent");
+	const skillDir = join(agentDir, "skills", "ambient-fixture");
+	mkdirSync(skillDir, { recursive: true });
+	writeFileSync(join(skillDir, "SKILL.md"), "---\nname: ambient-fixture\ndescription: fixture\n---\n\nfixture\n");
+	try {
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+		await loader.reload();
 
-	const discovered = loader.getExtensions().extensions.length;
-	const skills = loader.getSkills().skills.length;
+		const discovered = loader.getExtensions().extensions.length;
+		const skills = loader.getSkills().skills.length;
 
-	// This is the hazard, stated as a fact about this machine rather than a belief:
-	// anything discoverable here would be inherited by a nested session that used
-	// the default loader.
-	assert.ok(
-		discovered > 0 || skills > 0,
-		`expected ambient resources to exist (found ${discovered} extensions, ${skills} skills)`,
-	);
+		// Anything discoverable here would be inherited by a nested session that
+		// used the default loader; the fixture makes that fact deterministic.
+		assert.ok(
+			discovered > 0 || skills > 0,
+			`expected fixture resources to exist (found ${discovered} extensions, ${skills} skills)`,
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("MiniResourceLoader hands a summoned run a closed resource set", async () => {
