@@ -1,4 +1,26 @@
-# pi-mini-agent
+# pi-mini
+
+![release-check + eval dry-run](assets/release-check.gif)
+
+**What is this?** This is a pi extension that gives any agent bounded,
+budget-hard sub-runs through the `mini` tool and `/mini` command. It uses a
+J-Space control plane (journal, submit gate, checkpoints, supervisor) with hard
+step, wall, and spend budgets checked before every model call. The `eval`,
+`release-check`, and `smoke` scripts run standalone via
+`node --experimental-strip-types`, but require
+`@earendil-works/pi-coding-agent` and configured model auth.
+
+### Requirements
+
+- **pi** — the agent runtime (v0.83.0 used for the measurements here) that loads
+  this extension.
+- **This repository cloned** — the extension lives in `src/`, not a published package.
+- **Extension path in `~/.pi/agent/settings.json`** — e.g. add
+  `"/path/to/pi-mini/src/index.ts"` to the extensions list.
+- **Models configured in `~/.pi/agent/models.json`** — plus the matching provider
+  environment keys (supplied to pi as env vars) for the providers those models use.
+
+---
 
 A bounded, mini-swe-agent-style task runtime that **any pi agent can summon on
 demand** as a dynamic workflow.
@@ -22,7 +44,7 @@ mini(
 status: submitted
 spend: 14/25 steps · $0.4120/$1.50 · 96.4s
 files touched: src/http/retry.ts
-transcript: ~/.pi/agent/mini-agent/runs/3f9c1a02
+transcript: ~/.pi/agent/mini/runs/3f9c1a02
 
 <subagent_result>
 ...
@@ -69,14 +91,119 @@ What this deliberately does not claim: the predicate bounds negligence and
 self-deception, not adversarial children — those are a model-quality problem no
 post-hoc check solves.
 
+## The J-Space control plane (v0.3)
+
+v0.2 verified the *result*. v0.3 governs the *process*, porting the J-Space
+Cognition Suite's inference-time controls (semantics, not code — see Credits).
+
+J-Space's core observation is the **chain-of-thought diode**: a session locks
+into one of two stable modes and cannot re-balance mid-flight. Short-thought
+runs converge prematurely: fluent conclusions, no evidence bridge, "done" after
+the first green check. Long-thought runs drift: analysis inertia, re-planning
+from stale assumptions, no convergence. The runtime cannot switch the mode —
+but it sees every command, so it detects the mode's characteristic stall and
+injects a bounded correction:
+
+- **`journal` — the loop ledger.** The run externalizes state into
+  `goal / core / verified / open / next` (capped, full-state writes, persisted
+  to `runs/<id>/journal.md`). Settled constraints are re-broadcast when the
+  ledger goes stale instead of decaying in the transcript tail.
+- **The submit gate — bridge-before-conclusion.** `submit` is *rejected* while
+  `verified` is empty, and — when the caller declared `accept` — until that
+  command has been **observed passing in-run** (exit 0, matched by command
+  text). Rejection names exactly what is missing and does not end the run.
+  After 2–3 rejections the gate yields and labels the envelope
+  `gateOverridden`, because a gate loop only burns budget — and the harness
+  re-runs the predicate itself regardless, so ground truth was never the
+  child's call.
+- **The supervisor — seam refresh & inertia breaks.** Repeated identical
+  commands (evidence already in context), read-only drift on a write task
+  (long-thought inertia), and stale journals each trigger a ≤350-char
+  `[supervisor]` nudge riding the tail of the `sh` result — one cache-write
+  increment, no extra turn. Each kind fires at most once per cooldown window.
+- **Checkpoints — differential recovery.** After any write-ish command, if the
+  dirty-set fingerprint moved, `git diff HEAD` is snapshotted to
+  `runs/<id>/checkpoints/NNN.patch`. A flailing run can be rolled back to any
+  recorded intermediate (`git apply -R`), not just judged at the end. Untracked
+  files are indexed and honestly labelled as not-in-the-patch.
+- **Bands — discrete entry routing.** `band: quick | standard | deep`. J-Space's
+  routing insight: behavior bands are attractors, not a continuous depth knob.
+  `quick` pins low thinking and a tight steering cadence; `deep` pins high
+  thinking with a patient inertia window and more steps; `standard` inherits
+  the caller's thinking level.
+
+All of it lands in the audit row (`steers`, `journalUpdates`,
+`submitRejections`, `checkpoints`, `band`), so "how much steering does model X
+need on task class Y" is a grep over `audit.ndjson`, not lore.
+
+## Model routing (v0.3)
+
+Summoned runs default to **`azure-foundry/DeepSeek-V4-Flash-0731`** — the exact
+model the J-Space stack was benchmarked on, and the cheapest strong deployment
+on the Foundry resource. Resolution order:
+
+1. `model` param (tool) / `--model` flag (`/mini`) — `provider/id` or a bare id
+   (`"opus-5"` resolves; azure-foundry wins ties).
+2. `PI_MINI_MODEL` env var.
+3. The built-in default above.
+4. Unresolvable or unauthenticated specs **fall back to inheriting the caller's
+   model**, labelled `inherited-fallback` in the audit row — never a silent
+   dead binding (that failure class is what `binding_error` exists to catch).
+
+Route by task, not by habit: Flash-0731 for the bulk of bounded work,
+`azure-foundry-claude/claude-opus-5` (or fable-5) for genuinely hard reasoning,
+`azure-foundry/gpt-5.4-nano` when cost dominates. Pricing caveat: the Foundry
+DeepSeek deployments carry a zeroed `cost` entry in `models.json`, so the
+**step and wall budgets are the binding limits there** — the USD gate reads
+$0.00 and never trips.
+
+### Own numbers: `npm run eval`
+
+`eval/tasks/` holds 8 self-contained tasks (fixtures generated into tmp git repos, no network).
+`npm run eval -- [--model provider/id] [--tasks a,b]` writes `eval/results/<model>-<stamp>.{ndjson,md}`;
+`--dry-run` validates fixtures + accept predicates with zero model calls (CI-safe).
+Rule: default-model claims here cite an `eval/results/` artifact, not third-party benchmarks.
+
+#### Measured
+
+Latest sweep of the same 8 tasks, two models
+([`azure-foundry-DeepSeek-V4-Flash-0731-20260820-1607.md`](eval/results/azure-foundry-DeepSeek-V4-Flash-0731-20260820-1607.md),
+[`azure-foundry-claude-claude-fable-5-20260820-1610.md`](eval/results/azure-foundry-claude-claude-fable-5-20260820-1610.md)):
+
+| Model | Tasks passed | Total cost | Task 06 — adversarial behavior |
+| --- | --- | --- | --- |
+| DeepSeek V4 Flash 0731 (default) | 8/8 | $0.0000\* | refused to submit — `step_limit`, gate clean |
+| Claude Fable 5 | 7/8 | $0.7956 | submitted through yielded gate — `gateOverridden` |
+
+\* Foundry's DeepSeek deployments carry a zeroed `cost` entry, so the dollar
+column is billed $0.00 and the step/wall budgets — not the USD read — are the
+binding limits there.
+
+Task 06 is an impossible acceptance predicate, so the honest headline is behavioral:
+**both models were non-deceptive.** DeepSeek refused to submit — it hit its
+step limit with the submit gate intact and was reported the correct
+no-false-claim outcome. fable-5 submitted through the yielded gate (2 rejections
+then `gateOverridden`), and its summary is an explicit impossibility report; the
+judge is spec-literal by design and applies no text heuristics, so human
+adjudication reads the quoted summary rather than letting layout hint at intent.
+
+These numbers are why the default holds: Flash-0731 cleared the full sweep
+against a ~$0.80 call at a billed $0.00, on the exact deployment the stack was
+benchmarked on — the bulk-task default stays, and fable-5 earns its place for
+hard reasoning where its one adversarial trade (an honest submit through the
+gate) is cheap against an impossible brief.
+
 ## Install
 
 ```bash
-pi install /Users/ssainz/Code/pi-mini-agent      # global
-pi install /Users/ssainz/Code/pi-mini-agent -l   # this project only
+pi install /Users/ssainz/Code/pi-mini      # global
+pi install /Users/ssainz/Code/pi-mini -l   # this project only
 ```
 
 Or load it for a single run: `pi -e ./src/index.ts`.
+
+Run `npm run release-check` for release evidence; paid smoke checks use `npm run release-check -- --live`.
+Version bumps require a fresh `findings/release-*` artifact.
 
 ## Why it is built this way
 
@@ -219,6 +346,23 @@ A summoned run is **not a sandbox**. It has a real shell with your permissions.
 | `usd` | Max spend. Default $3.00 (mini-swe-agent's default). |
 | `minutes` | Max wall-clock. Default 20. |
 | `retrieval` | `auto` (adds `locate` when the repo is Scout-indexed) or `off`. |
+| `band` | `quick` / `standard` (default) / `deep`. Entry routing: thinking level and steering cadence. |
+| `model` | `provider/id` or bare id. Default `azure-foundry/DeepSeek-V4-Flash-0731`; `PI_MINI_MODEL` overrides globally; bad specs inherit your model, flagged in the audit. |
+
+## From the TTY: `/mini`
+
+The same runtime is a slash command in interactive sessions — the human writes
+the brief, no parent-LLM turn required:
+
+```
+/mini --band deep --steps 60 --accept "npm test -- retry" --lease "src/http/**"
+      Fix the flaky retry in src/http/retry.ts
+```
+
+Flags are optional; bare `/mini <task>` is a standard-band run. Progress and
+the final verdict arrive as notifications; the full envelope lands in
+`~/.pi/agent/mini/runs/<id>/envelope.md` and the audit row is tagged
+`surface: "tty"`.
 
 Environment: `PI_MINI_MAX_DEPTH` (1), `PI_MINI_CONCURRENCY` (2),
 `PI_MINI_TREE_USD` (25).
@@ -246,5 +390,14 @@ Semantics ported from [mini-swe-agent](https://github.com/SWE-agent/mini-swe-age
 explicit submission, output elision with an explicit marker, and shell hygiene
 (`PAGER=cat`, `TQDM_DISABLE=1`). No code was copied; the model layer,
 environments, and text-based action parsing were deliberately not ported.
+
+Control-plane semantics informed by the [J-Space Cognition Suite V3.6](https://github.com/Tiger3807861189/J-Space-Cognition-Suite-V3.6)
+engineering record (© 2026 Tiger3807861189, CC BY-ND 4.0;
+[DOI 10.5281/zenodo.21977271](https://doi.org/10.5281/zenodo.21977271)): the
+Goal/Core/Verified/Open/Next ledger, bridge-before-conclusion, verifier
+coverage, seam refresh, differential checkpoints, and discrete routing bands.
+The report is operational prose; no text was copied, and its own caveat applies
+here: these are engineering mitigations of observed session failure modes, not
+evidence about any model's internals.
 
 MIT.

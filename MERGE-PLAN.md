@@ -6,6 +6,17 @@ Fable (the orchestrator) writes **no code directly** — it specifies, delegates
 and verifies. Implementation is done by worker models: Terra, Sol, Luna,
 Opus 5, Grok 4.5 (Cursor), and other capable free models.
 
+## Status (2026-11-01)
+
+Phases 1 and 2 are done on local branch `consolidate/pi-mini`, except for
+archiving `sainzs/pi-mini` on GitHub, which still needs Santiago's approval.
+Phases 3 and 4 are not started.
+
+- The fork point is standalone `018945e` (exact match for all 20 vendored
+  files). `f855a0e` below does not exist in the `pi-mini` repo.
+- The standalone had grown past the 5-file drift described in Phase 1, so this
+  was a three-way merge. Hardening wins where the two sides truly clash.
+
 ## Phase 0 — Preconditions (fable, no code)
 - Personal identity only: `sainzs` GitHub, personal git email; never the Adobe
   account. Verify `git config user.email` in every repo touched before any commit.

@@ -1,5 +1,5 @@
 /**
- * pi-mini-agent — a bounded task runtime any agent can summon.
+ * pi-mini — a bounded task runtime any agent can summon.
  *
  * Registers one tool, `mini`. Give it a brief and a budget; it runs a
  * mini-swe-agent-style loop (one shell action per step, explicit submission) in a
@@ -21,15 +21,17 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DEFAULT_LIMITS, TreeBudget } from "./budget.ts";
 import { formatEnvelope, isFailure } from "./envelope.ts";
 import { hasLease, taskRequiresLease } from "./lease.ts";
 import { auditSummon } from "./ledger.ts";
-import { runMiniAgent } from "./runner.ts";
+import { ProviderQueue } from "./queue.ts";
+import { type Band, runMiniAgent } from "./runner.ts";
 
 const DEPTH_ENV = "PI_MINI_DEPTH";
 function readFiniteEnvNumber(
@@ -57,12 +59,87 @@ const MAX_CONCURRENCY = readFiniteEnvNumber("PI_MINI_CONCURRENCY", 2, { minimum:
 /** Ceiling shared by every run summoned from this process. */
 const TREE_CEILING_USD = readFiniteEnvNumber("PI_MINI_TREE_USD", 25, { minimum: 0.01, maximum: 1_000_000 });
 
-const BASE_DIR = join(homedir(), ".pi", "agent", "mini-agent");
+const BASE_DIR = join(homedir(), ".pi", "agent", "mini");
+
+/**
+ * The default summoned-run model. DeepSeek-V4-Flash-0731 is deliberate: it is
+ * the exact model the J-Space control plane was benchmarked on (NL2Repo
+ * 54.2→70.2, DeepSWE 54.4→67.4 with the ledger/gate/supervisor stack), and it
+ * is the cheapest strong deployment on the Azure Foundry resource. Override
+ * per run with the `model` param / `--model` flag, or globally with
+ * PI_MINI_MODEL. Unresolvable or unauthenticated specs fall back to
+ * inheriting the caller's model, never to a silent failure.
+ */
+const DEFAULT_MODEL_SPEC = "azure-foundry/DeepSeek-V4-Flash-0731";
+const MODEL_ENV = "PI_MINI_MODEL";
+
+type ModelShape = { id?: string; provider?: string };
+
+export interface ResolvedSummonModel<M extends ModelShape = ModelShape> {
+	model: M | undefined;
+	id: string;
+	/** Where the choice came from: param, env, built-in default, or inheritance. */
+	source: "param" | "env" | "default" | "inherited" | "inherited-fallback";
+}
+
+/**
+ * Resolve a model spec against the registry. `provider/id` is exact; a bare id
+ * matches case-insensitively, then by unique substring (azure-foundry wins
+ * ties, since that is where the budget-friendly deployments live).
+ */
+export function resolveSummonModel<M extends ModelShape>(
+	spec: string | undefined,
+	registry:
+		| {
+				find(provider: string, modelId: string): M | undefined;
+				getAvailable(): M[];
+				hasConfiguredAuth(model: M): boolean;
+		  }
+		| undefined,
+	inherited: M | undefined,
+): ResolvedSummonModel<M> {
+	const inherit: ResolvedSummonModel<M> = {
+		model: inherited,
+		id: inherited?.id ?? "inherited-unknown",
+		source: "inherited",
+	};
+
+	const attempt = (s: string, source: ResolvedSummonModel<M>["source"]): ResolvedSummonModel<M> | undefined => {
+		if (!registry) return undefined;
+		const trimmed = s.trim();
+		if (!trimmed) return undefined;
+		let found: M | undefined;
+		if (trimmed.includes("/")) {
+			const [provider, ...rest] = trimmed.split("/");
+			found = registry.find(provider, rest.join("/"));
+		} else {
+			const available = registry.getAvailable();
+			const exact = available.filter((m) => m.id?.toLowerCase() === trimmed.toLowerCase());
+			const pool = exact.length
+				? exact
+				: available.filter((m) => m.id?.toLowerCase().includes(trimmed.toLowerCase()));
+			found = pool.find((m) => m.provider === "azure-foundry") ?? pool[0];
+		}
+		if (!found || !registry.hasConfiguredAuth(found)) return undefined;
+		return { model: found, id: found.id ?? trimmed, source };
+	};
+
+	if (spec) {
+		const hit = attempt(spec, "param");
+		return hit ?? { ...inherit, source: "inherited-fallback" };
+	}
+	const env = process.env[MODEL_ENV];
+	if (env) {
+		const hit = attempt(env, "env");
+		return hit ?? { ...inherit, source: "inherited-fallback" };
+	}
+	return attempt(DEFAULT_MODEL_SPEC, "default") ?? { ...inherit, source: "inherited-fallback" };
+}
 
 const currentDepth = readFiniteEnvNumber(DEPTH_ENV, 0, { minimum: 0, maximum: 100, integer: true }, MAX_DEPTH);
 const treeBudget = new TreeBudget(TREE_CEILING_USD);
 
-/** Simple FIFO semaphore. */
+/** Total run cap; the provider queue below adds per-key limits and pacing. */
 class Semaphore {
 	private active = 0;
 	private readonly waiting: Array<{
@@ -121,6 +198,11 @@ class Semaphore {
 }
 
 const semaphore = new Semaphore(Math.max(1, MAX_CONCURRENCY));
+const providerQueue = new ProviderQueue();
+
+function summonQueueKey<M extends ModelShape>(resolved: ResolvedSummonModel<M>): string {
+	return `${resolved.model?.provider ?? "unknown"}/${resolved.model?.id ?? resolved.id}`;
+}
 
 /** Live runs, so a parent shutdown cannot leave orphans behind. */
 const live = new Set<AbortController>();
@@ -200,11 +282,29 @@ export default function (pi: ExtensionAPI) {
 						"the lease fails the result. Omit only for read-only work.",
 				}),
 			),
+			band: Type.Optional(
+				Type.Union([Type.Literal("quick"), Type.Literal("standard"), Type.Literal("deep")], {
+					description:
+						"Behavior band, routed at entry. `quick`: short-horizon tasks — low thinking, tight " +
+						"steering cadence. `deep`: long-horizon — high thinking, more steps, patient inertia " +
+						"window. `standard` (default): inherits the caller's thinking level. Bands are " +
+						"discrete on purpose; there is no useful middle knob.",
+				}),
+			),
+			model: Type.Optional(
+				Type.String({
+					description:
+						`Model for the run: \`provider/id\` or a bare id (e.g. \`${DEFAULT_MODEL_SPEC}\` — the ` +
+						"default, cheap and strong — or `azure-foundry-claude/claude-opus-5` for genuinely " +
+						"hard reasoning). Omit to use the default; an unresolvable or unauthenticated choice " +
+						"falls back to inheriting your model, flagged in the audit row.",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const runId = randomUUID().slice(0, 8);
-			const cwd = params.cwd ?? (ctx as ExtensionContext | undefined)?.cwd ?? process.cwd();
+			const cwd = params.cwd ?? ctx.cwd ?? process.cwd();
 			const limits = {
 				steps: params.steps ?? DEFAULT_LIMITS.steps,
 				usd: params.usd ?? DEFAULT_LIMITS.usd,
@@ -243,11 +343,19 @@ export default function (pi: ExtensionAPI) {
 			const onAbort = () => controller.abort();
 			if (signal?.aborted) controller.abort();
 			signal?.addEventListener("abort", onAbort, { once: true });
-			const startedAt = Date.now();
-			let release: (() => void) | undefined;
+
+			let globalRelease: (() => void) | undefined;
+			let queueRelease: (() => void) | undefined;
+			let queueWaitMs = 0;
+			let startedAt = Date.now();
 
 			try {
-				release = await semaphore.acquire(controller.signal);
+				globalRelease = await semaphore.acquire(controller.signal);
+				const resolved = resolveSummonModel(params.model, ctx.modelRegistry, ctx.model);
+				const queueStartedAt = Date.now();
+				queueRelease = await providerQueue.acquire(summonQueueKey(resolved), controller.signal);
+				queueWaitMs = Date.now() - queueStartedAt;
+				startedAt = Date.now();
 				onUpdate?.({ content: [{ type: "text", text: `mini ${runId}: starting` }], details: undefined });
 
 				const result = await runMiniAgent({
@@ -258,10 +366,11 @@ export default function (pi: ExtensionAPI) {
 					tree: treeBudget,
 					baseDir: BASE_DIR,
 					runId,
-					model: (ctx as ExtensionContext | undefined)?.model,
+					model: resolved.model,
 					retrieval: params.retrieval ?? "auto",
 					accept: params.accept,
 					lease: params.lease,
+					band: params.band,
 					signal: controller.signal,
 					onProgress: (text) =>
 						onUpdate?.({
@@ -274,16 +383,16 @@ export default function (pi: ExtensionAPI) {
 				// verdict, cost. This is what turns delegation from lore into data —
 				// which model passes which task class at what price is answerable by
 				// grepping audit.ndjson instead of remembering.
-				const model = (ctx as ExtensionContext | undefined)?.model as
-					| { id?: string; provider?: string }
-					| undefined;
+				const resolvedModel = resolved.model;
 				auditSummon(BASE_DIR, {
 					runId,
 					depth: currentDepth,
 					cwd,
 					task: params.task.slice(0, 400),
-					model: model?.id ?? "inherited-unknown",
-					provider: model?.provider,
+					model: resolvedModel?.id ?? "inherited-unknown",
+					modelSource: resolved.source,
+					provider: resolvedModel?.provider,
+					band: result.band,
 					exitReason: result.exitReason,
 					verified: result.verification ? result.verification.ok : "no-predicate",
 					leaseViolations: result.leaseViolations?.length ?? 0,
@@ -292,7 +401,14 @@ export default function (pi: ExtensionAPI) {
 					steps: result.steps,
 					costUsd: Number(result.costUsd.toFixed(4)),
 					elapsedMs: Date.now() - startedAt,
+					queueWaitMs,
 					treeSpentUsd: Number(treeBudget.spentUsd.toFixed(4)),
+					// J-Space control telemetry: how much steering this model needed on
+					// this task class. The diode made greppable.
+					steers: result.control.steers,
+					journalUpdates: result.control.journalUpdates,
+					submitRejections: result.control.submitRejections,
+					checkpoints: result.control.checkpoints,
 				});
 
 				return {
@@ -302,7 +418,14 @@ export default function (pi: ExtensionAPI) {
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				auditSummon(BASE_DIR, { runId, depth: currentDepth, cwd, exitReason: "error", error: message });
+				auditSummon(BASE_DIR, {
+					runId,
+					depth: currentDepth,
+					cwd,
+					exitReason: "error",
+					error: message,
+					queueWaitMs,
+				});
 				return {
 					content: [{ type: "text" as const, text: `mini ${runId} failed to start: ${message}` }],
 					details: undefined,
@@ -310,9 +433,207 @@ export default function (pi: ExtensionAPI) {
 				};
 			} finally {
 				signal?.removeEventListener("abort", onAbort);
-				release?.();
+				queueRelease?.();
+				globalRelease?.();
 				live.delete(controller);
 			}
 		},
 	});
+
+	// The TTY surface: `/mini` summons a run directly from the interactive
+	// prompt — no parent-LLM turn, no tool-call round trip. The human writes
+	// the brief; the runtime supplies the discipline.
+	//
+	//   /mini --band deep --steps 60 --accept "npm test -- retry" --lease "src/http/**"
+	//         Fix the flaky retry in src/http/retry.ts
+	//
+	// Flags are optional; bare `/mini <task>` is a standard-band run.
+	pi.registerCommand("mini", {
+		description:
+			"Summon a bounded sub-run (journal + submit gate + supervisor). " +
+			'Flags: --band quick|standard|deep --model "id-or-provider/id" --steps N --usd X ' +
+			'--minutes N --accept "cmd" --lease "globs,comma-sep" --cwd PATH --off (no scout). ' +
+			"Rest is the brief. Default model: DeepSeek-V4-Flash-0731.",
+		handler: async (args, ctx) => {
+			const parsed = parseCommandArgs(args);
+			if (!parsed.task) {
+				ctx.ui.notify(
+					"Usage: /mini [--band quick|standard|deep] [--steps N] [--usd X] [--minutes N] " +
+						'[--accept "cmd"] [--lease "g1,g2"] [--cwd PATH] [--off] <task brief>',
+					"warning",
+				);
+				return;
+			}
+			if (treeBudget.exhausted) {
+				ctx.ui.notify(
+					`mini: tree ceiling $${TREE_CEILING_USD.toFixed(2)} is spent ($${treeBudget.spentUsd.toFixed(2)}).`,
+					"error",
+				);
+				return;
+			}
+
+			const runId = randomUUID().slice(0, 8);
+			const limits = {
+				steps: parsed.steps ?? DEFAULT_LIMITS.steps,
+				usd: parsed.usd ?? DEFAULT_LIMITS.usd,
+				wallMs: (parsed.minutes ?? DEFAULT_LIMITS.wallMs / 60000) * 60_000,
+			};
+			const controller = new AbortController();
+			live.add(controller);
+			const globalRelease = await semaphore.acquire();
+			const resolved = resolveSummonModel(parsed.model, ctx.modelRegistry, ctx.model);
+			ctx.ui.notify(
+				`mini ${runId}: starting (${parsed.band ?? "standard"} band, ${resolved.id} [${resolved.source}], ` +
+					`${limits.steps} steps / $${limits.usd.toFixed(2)} / ${Math.round(limits.wallMs / 60000)}m)`,
+				"info",
+			);
+
+			let queueRelease: (() => void) | undefined;
+			let queueWaitMs = 0;
+			let startedAt = Date.now();
+			try {
+				const queueStartedAt = Date.now();
+				queueRelease = await providerQueue.acquire(summonQueueKey(resolved), controller.signal);
+				queueWaitMs = Date.now() - queueStartedAt;
+				startedAt = Date.now();
+				const result = await runMiniAgent({
+					task: parsed.task,
+					cwd: parsed.cwd ?? ctx.cwd,
+					limits,
+					tree: treeBudget,
+					baseDir: BASE_DIR,
+					runId,
+					model: resolved.model,
+					retrieval: parsed.retrieval,
+					accept: parsed.accept,
+					lease: parsed.lease,
+					band: parsed.band,
+					signal: controller.signal,
+				});
+
+				const envelope = formatEnvelope(result);
+				try {
+					writeFileSync(join(BASE_DIR, "runs", runId, "envelope.md"), envelope, "utf-8");
+				} catch {
+					// best-effort artifact
+				}
+				const ttyModel = resolved.model;
+				auditSummon(BASE_DIR, {
+					runId,
+					depth: currentDepth,
+					cwd: parsed.cwd ?? ctx.cwd,
+					task: parsed.task.slice(0, 400),
+					model: ttyModel?.id ?? "tty-unknown",
+					modelSource: resolved.source,
+					provider: ttyModel?.provider,
+					band: result.band,
+					exitReason: result.exitReason,
+					verified: result.verification ? result.verification.ok : "no-predicate",
+					leaseViolations: result.leaseViolations?.length ?? 0,
+					filesChanged: result.filesChanged.length,
+					filesChangedSource: result.filesChangedSource,
+					steps: result.steps,
+					costUsd: Number(result.costUsd.toFixed(4)),
+					elapsedMs: Date.now() - startedAt,
+					queueWaitMs,
+					treeSpentUsd: Number(treeBudget.spentUsd.toFixed(4)),
+					steers: result.control.steers,
+					journalUpdates: result.control.journalUpdates,
+					submitRejections: result.control.submitRejections,
+					checkpoints: result.control.checkpoints,
+					surface: "tty",
+				});
+
+				const verdict = result.verification
+					? result.verification.ok
+						? "verified PASS"
+						: "verified FAIL"
+					: result.exitReason;
+				ctx.ui.notify(
+					`mini ${runId}: ${verdict} · ${result.steps} steps · $${result.costUsd.toFixed(4)} · ` +
+						`envelope ${join(BASE_DIR, "runs", runId, "envelope.md")}`,
+					isFailure(result) ? "warning" : "info",
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				auditSummon(BASE_DIR, {
+					runId,
+					depth: currentDepth,
+					cwd: ctx.cwd,
+					exitReason: "error",
+					error: message,
+					queueWaitMs,
+					surface: "tty",
+				});
+				ctx.ui.notify(`mini ${runId} failed to start: ${message}`, "error");
+			} finally {
+				queueRelease?.();
+				globalRelease();
+				live.delete(controller);
+			}
+		},
+	});
+}
+
+interface CommandArgs {
+	task: string;
+	band?: Band;
+	model?: string;
+	steps?: number;
+	usd?: number;
+	minutes?: number;
+	accept?: string;
+	lease?: string[];
+	cwd?: string;
+	retrieval: "auto" | "off";
+}
+
+/** Shell-ish flag parsing for the /mini command: --flag value, \"--quoted\" values. */
+function parseCommandArgs(args: string): CommandArgs {
+	const tokens = args.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+	const out: CommandArgs = { task: "", retrieval: "auto" };
+	const rest: string[] = [];
+	const unquote = (s: string) => s.replace(/^["']|["']$/g, "");
+	for (let i = 0; i < tokens.length; i++) {
+		const tok = tokens[i];
+		const next = () => unquote(tokens[++i] ?? "");
+		switch (tok) {
+			case "--band": {
+				const b = next();
+				if (b === "quick" || b === "standard" || b === "deep") out.band = b;
+				break;
+			}
+			case "--steps":
+				out.steps = Math.max(1, Number(next()) || 0);
+				break;
+			case "--usd":
+				out.usd = Math.max(0.01, Number(next()) || 0);
+				break;
+			case "--minutes":
+				out.minutes = Math.max(1, Number(next()) || 0);
+				break;
+			case "--model":
+				out.model = next();
+				break;
+			case "--accept":
+				out.accept = next();
+				break;
+			case "--lease":
+				out.lease = next()
+					.split(",")
+					.map((s) => s.trim())
+					.filter(Boolean);
+				break;
+			case "--cwd":
+				out.cwd = next();
+				break;
+			case "--off":
+				out.retrieval = "off";
+				break;
+			default:
+				rest.push(tok);
+		}
+	}
+	out.task = rest.join(" ").trim();
+	return out;
 }

@@ -22,11 +22,15 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Budget, type BudgetLimits, type ExitReason, normalizeBudgetLimits, type TreeBudget } from "./budget.ts";
+import { CheckpointRecorder } from "./checkpoints.ts";
 import type { RunResult } from "./envelope.ts";
+import { createSubmitGate } from "./gate.ts";
+import { createJournalState, createJournalTool, JournalSeam, renderJournal } from "./journal.ts";
 import { captureLeaseBaseline, hasLease, leaseViolations, observeChanges, taskRequiresLease } from "./lease.ts";
 import { appendRecord, createLedger } from "./ledger.ts";
 import { MiniResourceLoader } from "./loader.ts";
 import { buildSystemPrompt, buildTaskMessage } from "./prompt.ts";
+import { BANDS, Supervisor } from "./supervisor.ts";
 import {
 	createLocateTool,
 	createShTool,
@@ -36,6 +40,21 @@ import {
 	scoutCanServe,
 } from "./tools.ts";
 import { runAcceptance } from "./verify.ts";
+
+/** pi's documented thinking levels (`pi --help`); pi-agent-core is not a direct dep. */
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * Discrete behavior bands — J-Space's routing insight, and its caution: treat
+ * bands as attractors, not a continuous depth knob. `standard` inherits the
+ * caller's thinking level rather than pinning an unstable middle.
+ */
+export type Band = "quick" | "standard" | "deep";
+const BAND_THINKING: Record<Band, ThinkingLevel | undefined> = {
+	quick: "low",
+	standard: undefined,
+	deep: "high",
+};
 
 export interface RunOptions {
 	task: string;
@@ -57,6 +76,8 @@ export interface RunOptions {
 	accept?: string;
 	/** Write-set lease: glob/path patterns the child may change. Observed, not sandboxed. */
 	lease?: string[];
+	/** Behavior band: entry routing + supervisor cadence. Default `standard`. */
+	band?: Band;
 	signal?: AbortSignal;
 	onProgress?: (text: string) => void;
 }
@@ -80,6 +101,18 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 
 	const hasLocate = options.retrieval === "auto" && (await scoutCanServe(options.cwd));
 
+	// The J-Space control plane for this run: externalized ledger (journal),
+	// stall/inertia detection (supervisor), and recovery points (checkpoints).
+	const band: Band = options.band ?? "standard";
+	const tuning = BANDS[band];
+	const journal = createJournalState();
+	const seam = new JournalSeam();
+	const supervisor = new Supervisor({
+		expectsWrite: (options.lease?.length ?? 0) > 0,
+		tuning,
+	});
+	const checkpoints = new CheckpointRecorder(options.cwd, ledger.dir, leaseBaseline.root);
+
 	let submitted: SubmitDetails | undefined;
 	let sessionRef: AgentSession | undefined;
 	let stopReason: ExitReason | undefined;
@@ -96,6 +129,36 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	};
 
 	/**
+	 * Throttle bookkeeping, shared by the subscribe handler (which sees the
+	 * 429/5xx arrive) and the gate (which paces the retry before the next
+	 * request). `throttledRetries` is the run total reported in the envelope;
+	 * `throttleStreak` is the consecutive count that drives the backoff
+	 * exponent and resets on any successful assistant message.
+	 */
+	let lastProviderError: string | undefined;
+	let throttledRetries = 0;
+	let throttleStreak = 0;
+	let pendingBackoffMs = 0;
+	/**
+	 * Context-ceiling hits this run. The first triggers the harder-elision
+	 * recovery below; the second is terminal (`isTerminalOverflow`).
+	 */
+	let contextOverflows = 0;
+
+	/**
+	 * The submit gate — J-Space's bridge-before-conclusion and verifier coverage,
+	 * moved from discipline into the harness. Acceptance is executed HERE, not
+	 * inferred from the child's `sh` command text (see `gate.ts`).
+	 */
+	const { gate: submitGate, state: gateState } = createSubmitGate({
+		hasVerified: () => journal.verified.length > 0,
+		accept: options.accept,
+		cwd: options.cwd,
+		maxRejections: tuning.maxSubmitRejections,
+		signal: verificationController.signal,
+	});
+
+	/**
 	 * The pre-spend gate.
 	 *
 	 * `before_provider_request` fires after the payload is serialized and before
@@ -107,21 +170,38 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	 * We both abort the session and throw: the abort stops the loop, and the
 	 * throw stops *this* request even if the runner swallows handler errors.
 	 * Worst case the overrun is bounded to a single request.
+	 *
+	 * The handler is async on purpose: the extension runner awaits it
+	 * (`await handler(event, ctx)` in core/extensions/runner.js), so a sleep
+	 * here genuinely delays the HTTP call. That is where throttle backoff
+	 * lands — the subscribe handler cannot pause the session's own retry loop.
 	 */
 	const gate = {
 		event: "before_provider_request",
-		handler: () => {
+		handler: async () => {
+			// Pace the retry a throttled reply earned. Skipped when the remaining
+			// wall budget is shorter than the delay: better to trip wall_limit
+			// honestly than to sleep through the deadline and report a nap.
+			if (pendingBackoffMs > 0) {
+				const delay = pendingBackoffMs;
+				pendingBackoffMs = 0;
+				if (budget.limits.wallMs - budget.elapsedMs >= delay) {
+					await new Promise((resolve) => setTimeout(resolve, delay));
+				}
+			}
+			// Checked after the sleep so a stop that lands during backoff still
+			// prevents this request.
 			if (runController.signal.aborted) {
 				const stop = stopReason ?? (budget.elapsedMs >= budget.limits.wallMs ? "wall_limit" : "aborted");
 				stopRun(stop);
 				appendRecord(ledger.transcript, { type: "budget_stop", reason: stop, ...budget.snapshot() });
-				throw new Error(`mini-agent stopped: ${stop}`);
+				throw new Error(`pi-mini stopped: ${stop}`);
 			}
 			const stop = budget.checkBeforeCall();
 			if (stop) {
 				stopRun(stop);
 				appendRecord(ledger.transcript, { type: "budget_stop", reason: stop, ...budget.snapshot() });
-				throw new Error(`mini-agent budget stop: ${stop}`);
+				throw new Error(`pi-mini budget stop: ${stop}`);
 			}
 			budget.countStep();
 			options.onProgress?.(`step ${budget.steps}/${budget.limits.steps} · $${budget.usd.toFixed(3)}`);
@@ -130,10 +210,27 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	};
 
 	const tools: ToolDefinition[] = [
-		createShTool({ cwd: options.cwd, budget, ledger, commandPrefix: SH_COMMAND_PREFIX }),
-		createSubmitTool((details) => {
-			submitted = details;
+		createShTool({
+			cwd: options.cwd,
+			budget,
+			ledger,
+			commandPrefix: SH_COMMAND_PREFIX,
+			supervisor,
+			checkpoints,
+			lastJournalStep: () => journal.lastJournalStep,
+			journal,
+			seam,
 		}),
+		createSubmitTool(
+			(details) => {
+				submitted = details;
+			},
+			submitGate,
+			() => {
+				appendRecord(ledger.transcript, { type: "submit_rejected", count: gateState.rejections });
+			},
+		),
+		createJournalTool({ state: journal, dir: ledger.dir, currentStep: () => budget.steps }),
 	];
 	if (hasLocate) tools.push(createLocateTool(options.cwd));
 
@@ -142,12 +239,16 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 		hasLocate,
 		cwd: options.cwd,
 		lease: options.lease,
+		band,
 	});
 
 	const { session } = await createAgentSession({
 		cwd: options.cwd,
 		model: options.model,
 		modelRuntime: options.modelRuntime,
+		// Band routing happens at entry (J-Space): quick/deep pin a thinking level;
+		// standard inherits the caller's.
+		...(BAND_THINKING[band] ? { thinkingLevel: BAND_THINKING[band] as never } : {}),
 		sessionManager: SessionManager.inMemory(),
 		resourceLoader: new MiniResourceLoader({ systemPrompt, handlers: [gate] }),
 		customTools: tools,
@@ -173,17 +274,79 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 		budget.releaseReservations();
 	};
 
-	// Charge spend as it is observed, and keep a full local transcript.
+	// Charge spend as it is observed, and keep a full local transcript. Provider
+	// failures (429 throttling, 5xx, context overflow) end as assistant messages
+	// with an errorMessage rather than a thrown prompt — capture the last one, or
+	// a run killed by throttling reports only its lease warning as the "error".
+	// Observed 2026-08-20: four consecutive 429s on DeepSeek-V4-Flash-0731
+	// burned steps 4–7 and the envelope never mentioned the rate limit.
 	const unsubscribe = session.subscribe((event) => {
 		if (event.type !== "message_end") return;
 		const message = event.message as {
 			role?: string;
+			stopReason?: string;
+			errorMessage?: string;
 			usage?: { cost?: { total?: number } };
 		};
 		if (message.role === "assistant" && typeof message.usage?.cost?.total === "number") {
 			// Zero-cost responses matter: they reconcile and release the reservation
 			// even when the provider reports no billable usage.
 			budget.charge(message.usage.cost.total);
+		}
+		if (message.role === "assistant" && message.stopReason === "error" && message.errorMessage) {
+			lastProviderError = message.errorMessage.slice(0, 300);
+			const errorClass = classifyProviderError(message.errorMessage);
+			if (errorClass === "throttled") {
+				// The step was pre-charged in the gate but the request did no work:
+				// hand it back, and pace the retry the session is about to make on
+				// its own. The wall clock is the backstop that bounds this loop —
+				// near the deadline the gate skips the sleep and wall_limit trips.
+				budget.refundStep();
+				throttledRetries++;
+				pendingBackoffMs = backoffDelayMs(throttleStreak++);
+				appendRecord(ledger.transcript, {
+					type: "throttled",
+					retries: throttledRetries,
+					backoffMs: pendingBackoffMs,
+					error: lastProviderError,
+				});
+			} else if (errorClass === "context_overflow") {
+				// Context-ceiling recovery. The FIRST overflow earns one
+				// harder-elision retry instead of death:
+				//  (a) halve future observation retention — the full outputs are on
+				//      disk, so this costs cache-reads, not evidence;
+				//  (b) arm the seam's elision path (reused, not duplicated): the
+				//      next sh result carries the full journal re-broadcast, so
+				//      settled constraints survive the compaction the session is
+				//      about to perform;
+				//  (c) refund the pre-charged step — same rationale as throttling:
+				//      no work happened.
+				// pi's session does the retry itself (one compact-and-retry via
+				// `_checkCompaction`, then it settles), so the SECOND overflow
+				// needs no action here: the run ends and the exit mapping below
+				// names it "context_overflow".
+				contextOverflows++;
+				if (contextOverflows === 1) {
+					ledger.tightenObservationCaps();
+					seam.tail({
+						state: journal,
+						step: budget.steps,
+						digestEvery: 0,
+						journalNudge: true,
+						elidedThisStep: true,
+					});
+					budget.refundStep();
+				}
+				appendRecord(ledger.transcript, {
+					type: "context_overflow",
+					count: contextOverflows,
+					capsHalved: contextOverflows === 1,
+					error: lastProviderError,
+				});
+			}
+		} else if (message.role === "assistant") {
+			// A successful reply ends the throttle streak; the run total stands.
+			throttleStreak = 0;
 		}
 		appendRecord(ledger.transcript, { type: "message", message: event.message });
 	});
@@ -218,14 +381,46 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 	}
 
 	let exitReason: ExitReason = budget.tripped ?? stopReason ?? (submitted ? "submitted" : "error");
+	if (exitReason === "error" && !error && lastProviderError) {
+		error = lastProviderError;
+	}
 
 	// A dead model binding fails on the FIRST provider call with an auth/config
 	// error. Without this classification it reads as a generic "error" — or
 	// worse, in harnesses without a submission contract, as silent success.
 	// Observed 2026-08-07: a whole dispatch wave "completed" against a disabled
 	// provider having done zero work.
-	if (exitReason === "error" && error && budget.steps <= 1 && BINDING_ERROR_RX.test(error)) {
+	if (exitReason === "error" && error && budget.steps <= 1 && classifyProviderError(error) === "binding") {
 		exitReason = "binding_error";
+	}
+
+	// A run killed by throttling must say so. With the burned steps refunded,
+	// "throttled" names the actual cause — the provider, not the work — where
+	// the observed 2026-08-20 failure surfaced as a generic "error" after four
+	// 429s. "aborted" and "binding_error" outrank it: user intent and a dead
+	// binding are never throttling, whatever the last error text matched.
+	if (
+		!submitted &&
+		exitReason !== "aborted" &&
+		exitReason !== "binding_error" &&
+		lastProviderError &&
+		classifyProviderError(lastProviderError) === "throttled"
+	) {
+		exitReason = "throttled";
+	}
+
+	// A run killed by the context ceiling must say so. The first overflow was
+	// absorbed (caps halved, journal re-broadcast armed, step refunded); the
+	// second means the session's one compact-and-retry is spent, so the run
+	// stops as "context_overflow" rather than a generic "error". Same exclusion
+	// order as throttling: user intent and a dead binding are never the ceiling.
+	if (
+		!submitted &&
+		exitReason !== "aborted" &&
+		exitReason !== "binding_error" &&
+		isTerminalOverflow(contextOverflows, lastProviderError)
+	) {
+		exitReason = "context_overflow";
 	}
 
 	try {
@@ -254,7 +449,11 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 		if (budget.elapsedMs >= limits.wallMs && stopReason === undefined) {
 			stopRun("wall_limit");
 		}
-		exitReason = budget.tripped ?? stopReason ?? exitReason;
+		// A diagnosed provider failure names the real cause. The budget stop it
+		// provoked must not overwrite that with a generic limit.
+		if (exitReason !== "throttled" && exitReason !== "context_overflow") {
+			exitReason = budget.tripped ?? stopReason ?? exitReason;
+		}
 
 		const result: RunResult = {
 			exitReason,
@@ -268,11 +467,30 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 			ledgerDir: ledger.dir,
 			steps: budget.steps,
 			costUsd: budget.usd,
+			band,
+			...(options.model?.id ? { model: options.model.id } : {}),
+			control: {
+				journalUpdates: journal.updates,
+				verifiedEntries: journal.verified.length,
+				openItems: journal.open.length,
+				steers: { ...supervisor.counts },
+				checkpoints: checkpoints.count,
+				...(checkpoints.count > 0 ? { checkpointsDir: checkpoints.dir } : {}),
+				submitRejections: gateState.rejections,
+				throttledRetries,
+				...(contextOverflows > 0 ? { contextOverflows } : {}),
+				...(gateState.gateOverridden ? { gateOverridden: true } : {}),
+				...(options.accept ? { acceptPassObserved: gateState.acceptObservedPass } : {}),
+			},
 			...(error ? { error } : {}),
 			...(changes.unverifiable
 				? { error: [error, `[lease] ${changes.unverifiable}`].filter(Boolean).join("; ") }
 				: {}),
 		};
+
+		// The final journal state is an artifact the caller can read without the
+		// transcript: J-Space's ledger is the run's durable memory.
+		appendRecord(ledger.transcript, { type: "journal_final", journal: renderJournal(journal) });
 
 		appendRecord(ledger.transcript, { type: "result", result });
 		return result;
@@ -284,6 +502,70 @@ export async function runMiniAgent(options: RunOptions): Promise<RunResult> {
 /** Signatures of a dead/misconfigured model binding on the first call. */
 const BINDING_ERROR_RX =
 	/\b401\b|\b403\b|unauthorized|forbidden|api key|apikey|model is disabled|no provider|model not found|missing.*base.?url|invalid.*credential/i;
+
+/**
+ * Signatures of a provider error worth retrying: throttling and transient
+ * transport failure. The 429 shape is verbatim from the observed failure
+ * (azure-foundry/DeepSeek-V4-Flash-0731, eastus2, 2026-08-20):
+ * `429: {"code":"RateLimitReached","message":"..."}`. Auth errors are
+ * deliberately absent — a 401 must stay a binding error, never a retry.
+ */
+export const RETRYABLE_RX = /\b429\b|rate.?limit|\b50[0-9]\b|overloaded|econnreset|etimedout|socket hang up/i;
+
+/**
+ * Signatures of a prompt that exceeded the model's context window. A subset of
+ * pi-ai's OVERFLOW_PATTERNS (`src/utils/overflow.ts`) covering the shapes we
+ * can act on. Deliberately NOT in RETRYABLE_RX: pacing and resending the same
+ * oversized payload would just re-hit the same wall — the recovery is a
+ * smaller request, not a later one. Known regex tradeoff, shared with pi-ai's
+ * own NON_OVERFLOW guard: Bedrock's throttling text "Too many tokens, please
+ * wait ..." matches /too many tokens/i and reads as overflow; pi still treats
+ * that message as auto-retryable, so the run gets its retry either way.
+ */
+export const CONTEXT_OVERFLOW_RX =
+	/context.{0,20}(length|window|limit)|maximum context|too many tokens|prompt is too long|input is too long/i;
+
+/** What a provider error message means for the run's budget and pacing. */
+export type ProviderErrorClass = "throttled" | "binding" | "context_overflow" | "fatal";
+
+/**
+ * Classify a provider error string. Binding is checked first: refunding steps
+ * for an auth failure would let the session's auto-continue loop spin forever
+ * without spending anything, so a dead binding must never read as retryable.
+ * Overflow is checked before throttle: a too-large request that happens to
+ * carry a 429 shape is the ceiling, not rate limiting.
+ */
+export function classifyProviderError(errorMessage: string): ProviderErrorClass {
+	if (BINDING_ERROR_RX.test(errorMessage)) return "binding";
+	if (CONTEXT_OVERFLOW_RX.test(errorMessage)) return "context_overflow";
+	if (RETRYABLE_RX.test(errorMessage)) return "throttled";
+	return "fatal";
+}
+
+/**
+ * Is this overflow streak terminal? The FIRST overflow in a run earns the
+ * harder-elision retry (caps halved, journal re-broadcast armed, step
+ * refunded; pi's session then compact-and-retries on its own — the overflow
+ * branch of `_checkCompaction` in agent-session.js). The SECOND means that
+ * recovery is spent. Guarded by the last error's class so a run that recovered
+ * and later died of something else is not mislabeled.
+ */
+export function isTerminalOverflow(overflows: number, lastProviderError: string | undefined): boolean {
+	return (
+		overflows >= 2 &&
+		lastProviderError !== undefined &&
+		classifyProviderError(lastProviderError) === "context_overflow"
+	);
+}
+
+/**
+ * Exponential backoff with jitter, capped at 30 s — the delay before the next
+ * provider request after a throttled reply. `jitterMs` is injectable so the
+ * formula is directly testable; in a run it is uniform in [0, 500).
+ */
+export function backoffDelayMs(attempt: number, jitterMs = Math.random() * 500): number {
+	return Math.min(1000 * 2 ** attempt + jitterMs, 30_000);
+}
 
 /**
  * When a run ends without submitting, salvage the last assistant text.

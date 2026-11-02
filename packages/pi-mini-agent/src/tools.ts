@@ -12,7 +12,14 @@ import { promisify } from "node:util";
 import { createBashToolDefinition, defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Budget } from "./budget.ts";
+import type { CheckpointRecorder } from "./checkpoints.ts";
+import { scrubEnv } from "./envscrub.ts";
+import type { SubmitGate } from "./gate.ts";
+import type { JournalSeam, JournalState } from "./journal.ts";
 import { type RunLedger, recordObservation } from "./ledger.ts";
+import type { Supervisor } from "./supervisor.ts";
+
+export type { SubmitGate } from "./gate.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,6 +41,16 @@ export interface ShToolInput {
 	ledger: RunLedger;
 	/** Prefix applied to every command — used for output hygiene (PAGER=cat etc). */
 	commandPrefix?: string;
+	/** J-Space control plane: stall detection + steering nudges. */
+	supervisor?: Supervisor;
+	/** Diff snapshots after write-ish commands. */
+	checkpoints?: CheckpointRecorder;
+	/** Step of the last journal write, for staleness nudges. */
+	lastJournalStep?: () => number;
+	/** Externalized run journal — the mechanical digest rides the `sh` tail. */
+	journal?: JournalState;
+	/** Seam recovery: cadenced digest + one-shot full re-broadcast after elision. */
+	seam?: JournalSeam;
 }
 
 /**
@@ -51,12 +68,19 @@ export const SH_COMMAND_PREFIX = [
  *
  * Wrapping rather than reimplementing keeps detached process groups, tree kill
  * on abort, output truncation and temp-file spill (`src/core/tools/bash.ts`) —
- * all of which are already correct. We add exactly two things: a mandatory
- * timeout, and ledger-backed elision.
+ * all of which are already correct. We add three things: a mandatory timeout,
+ * ledger-backed elision, and env scrubbing — the child shell must not see the
+ * parent's credentials (threat and policy in `envscrub.ts`).
  */
 export function createShTool(input: ShToolInput): ToolDefinition {
-	const { cwd, budget, ledger, commandPrefix } = input;
-	const base = createBashToolDefinition(cwd, { commandPrefix, exposeSessionEnvironment: false });
+	const { cwd, budget, ledger, commandPrefix, supervisor, checkpoints, lastJournalStep, journal, seam } = input;
+	const base = createBashToolDefinition(cwd, {
+		commandPrefix,
+		exposeSessionEnvironment: false,
+		// Replace the child's environment outright: `resolveSpawnContext`
+		// would otherwise spread the full parent env into every command.
+		spawnHook: (context) => ({ ...context, env: scrubEnv(context.env) }),
+	});
 
 	return {
 		...base,
@@ -79,12 +103,41 @@ export function createShTool(input: ShToolInput): ToolDefinition {
 
 			const result = await base.execute(toolCallId, withTimeout as never, signal, onUpdate, ctx);
 
+			// The supervisor sees every command: stall signals, and whether this
+			// step plausibly moved the work tree (→ checkpoint). Acceptance is
+			// no longer inferred from command text — the submit gate executes
+			// the predicate itself (see `gate.ts`).
+			const writeish = supervisor?.noteCommand(params.command) ?? false;
+			if (writeish && checkpoints?.active) {
+				await checkpoints.maybeSnapshot(budget.steps);
+			}
+
 			// Route the text through the ledger, then append the budget nudge so the
 			// model can choose to submit rather than be cut off.
 			const content = (result.content ?? []).map((block) => {
 				if (block.type !== "text") return block;
 				return { ...block, text: recordObservation(ledger, budget.steps, block.text, toolCallId) };
 			});
+			const elidedThisStep = content.some((block) => block.type === "text" && block.text.includes("<elided_chars>"));
+
+			// J-Space steering rides the tail of the observation the model is about
+			// to read: one cache-write increment, no extra turn.
+			const nudge = supervisor?.nudge(budget.steps, lastJournalStep?.() ?? -1);
+			if (nudge) content.push({ type: "text" as const, text: `\n${nudge.text}` });
+
+			// Settled constraints re-broadcast themselves — harness-enforced, never
+			// prompt-requested. The stale-journal nudge still asks for a fresh write;
+			// the digest covers decay of state that is already settled.
+			if (journal && seam) {
+				const seamTail = seam.tail({
+					state: journal,
+					step: budget.steps,
+					digestEvery: supervisor?.digestEvery ?? 0,
+					journalNudge: nudge?.kind === "journal",
+					elidedThisStep,
+				});
+				if (seamTail) content.push({ type: "text" as const, text: `\n${seamTail}` });
+			}
 
 			const warning = budget.warningLine();
 			if (warning) content.push({ type: "text" as const, text: `\n${warning}` });
@@ -106,14 +159,21 @@ export interface SubmitDetails {
  * unreliable; a required terminating tool call makes the result machine-checkable
  * and lets the run end without paying for another LLM turn (`terminate: true`).
  */
-export function createSubmitTool(onSubmit: (details: SubmitDetails) => void): ToolDefinition {
+export function createSubmitTool(
+	onSubmit: (details: SubmitDetails) => void,
+	gate?: SubmitGate,
+	onRejected?: () => void,
+): ToolDefinition {
 	return defineTool({
 		name: "submit",
 		label: "submit",
 		executionMode: "sequential",
 		description:
 			"Report your final result and end the run. Call this exactly once, as your last action. " +
-			"If you are out of budget, submit whatever you have verified so far rather than nothing.",
+			"The run must be bridged to evidence first: at least one journal `verified` entry, and — when " +
+			"an acceptance command was declared — the harness will execute it at submit time and require " +
+			"exit 0. A rejected submit does not end the run; fix what it names and resubmit. If you are " +
+			"out of budget, submit whatever you have verified so far rather than nothing.",
 		promptSnippet: "Report the final result and end the run",
 		parameters: Type.Object({
 			summary: Type.String({
@@ -128,6 +188,23 @@ export function createSubmitTool(onSubmit: (details: SubmitDetails) => void): To
 			),
 		}),
 		async execute(_toolCallId, params) {
+			const verdict = (await gate?.()) ?? { ok: true as const };
+			if (!verdict.ok) {
+				onRejected?.();
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`SUBMIT REJECTED — ${verdict.reason}\n` +
+								"Fix exactly that, then call submit again. This rejection does not consume your result; " +
+								"nothing has been reported to the caller yet.",
+						},
+					],
+					details: undefined,
+					isError: true,
+				};
+			}
 			const details: SubmitDetails = {
 				summary: params.summary,
 				filesChanged: params.filesChanged ?? [],

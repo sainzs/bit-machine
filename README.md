@@ -41,8 +41,8 @@ ledger grows more valuable with use. Bit Machine invests there.
 
 ## Status
 
-- `packages/pi-mini-agent` — working; 34/34 tests + 3 live smokes (also
-  developed standalone at `sainzs/pi-mini-agent`; imported here by subtree).
+- `packages/pi-mini-agent` — working; 114/114 tests + 3 live smokes. Canonical
+  home since the merge of standalone `sainzs/pi-mini` v0.4.0, with its history.
 - `packages/bit-machine-harness` — v0: standing memory, two scopes (`~/.bit-machine`
   global, `<repo>/.bit-machine` project), `remember` tool, per-turn injection.
   9/9 tests; live cross-session round-trip proven.

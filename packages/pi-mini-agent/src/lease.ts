@@ -40,7 +40,7 @@ export interface LeaseBaseline {
 	root?: string;
 }
 
-async function git(cwd: string, args: string[]): Promise<string> {
+export async function git(cwd: string, args: string[]): Promise<string> {
 	const { stdout } = await execFileAsync("git", args, {
 		cwd,
 		timeout: GIT_TIMEOUT_MS,
@@ -51,7 +51,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
 }
 
 /** Parse `git status --porcelain=v1 -z` into repo-relative paths. */
-function porcelainPaths(raw: string): string[] {
+export function porcelainPaths(raw: string): string[] {
 	const out: string[] = [];
 	const fields = raw.split("\0");
 	for (let i = 0; i < fields.length; i++) {
@@ -69,7 +69,7 @@ function porcelainPaths(raw: string): string[] {
 	return out;
 }
 
-function fingerprint(root: string, rel: string): string {
+export function fingerprint(root: string, rel: string): string {
 	try {
 		const absolute = join(root, rel);
 		const s = statSync(absolute);
