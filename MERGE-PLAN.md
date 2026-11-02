@@ -8,8 +8,8 @@ Opus 5, Grok 4.5 (Cursor), and other capable free models.
 
 ## Status (2026-11-01)
 
-Phases 1 and 2 are done on local branch `consolidate/pi-mini`, except for
-archiving `sainzs/pi-mini` on GitHub, which still needs Santiago's approval.
+Phases 1 and 2 are done in merge commit `ec3256b89`, except for archiving
+`sainzs/pi-mini` on GitHub, which still needs Santiago's approval.
 Phases 3 and 4 are not started.
 
 - The fork point is standalone `018945e` (exact match for all 20 vendored
